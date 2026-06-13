@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
 from uuid import uuid4
 
 import streamlit as st
 
-from app.observability import load_run_view
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from .observability import load_run_view
+except ImportError:
+    from observability import load_run_view
+
 from harness.orchestrator import Orchestrator
 from harness.state import RunState, Stage
 from workers.mock_checker import MockChecker
