@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: econcheck-fired-festival
+Version: 0.1.0
+Summary: A governed economic-analysis harness for querying FRED data.
+Requires-Python: >=3.11
+Requires-Dist: streamlit
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
