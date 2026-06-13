@@ -86,6 +86,40 @@ class DataSelectionArtifact:
 
 
 @dataclass
+class DataArtifact:
+    series_ids: list[str]
+    observations: dict[str, list[dict[str, Any]]]
+    metadata: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        _require_string_list("series_ids", self.series_ids)
+        _require_dict("observations", self.observations)
+        for series_id, rows in self.observations.items():
+            _require_string("observations key", series_id)
+            _require_list_of_dicts(f"observations[{series_id}]", rows)
+        _require_dict("metadata", self.metadata)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "series_ids": list(self.series_ids),
+            "observations": {
+                series_id: [dict(row) for row in rows]
+                for series_id, rows in self.observations.items()
+            },
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "DataArtifact":
+        _require_mapping(data)
+        return cls(
+            series_ids=_required(data, "series_ids"),
+            observations=_required(data, "observations"),
+            metadata=_required(data, "metadata"),
+        )
+
+
+@dataclass
 class CodeArtifact:
     code: str
 
@@ -229,6 +263,11 @@ def _require_list(field_name: str, value: Any) -> None:
         raise ArtifactValidationError(f"{field_name} must be a list")
 
 
+def _require_dict(field_name: str, value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ArtifactValidationError(f"{field_name} must be a dict")
+
+
 def _require_string_list(field_name: str, value: Any) -> None:
     _require_list(field_name, value)
     for index, item in enumerate(value):
@@ -254,7 +293,7 @@ def _require_list_of_dicts(field_name: str, value: Any) -> None:
 
 def _require_retry_from(field_name: str, value: Any) -> None:
     _require_string(field_name, value)
-    allowed_values = {"planning", "data_discovery", "code_generation", "draft_answer"}
+    allowed_values = {"", "planning", "data_discovery", "code_generation", "draft_answer"}
     if value not in allowed_values:
-        allowed = ", ".join(sorted(allowed_values))
+        allowed = ", ".join(repr(item) for item in sorted(allowed_values))
         raise ArtifactValidationError(f"{field_name} must be one of: {allowed}")

@@ -42,6 +42,20 @@ def save_artifact(
     return path
 
 
+def save_text_artifact(
+    run_id: str,
+    artifact_name: str,
+    text: str,
+    runs_dir: str | Path = DEFAULT_RUNS_DIR,
+) -> Path:
+    run_dir = _run_dir(run_id, runs_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    path = run_dir / artifact_name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
 def load_artifact(
     run_id: str,
     artifact_name: str,

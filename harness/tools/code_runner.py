@@ -22,6 +22,7 @@ def run_analysis_code(
     code_artifact: CodeArtifact,
     data_artifact: Any,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    output_log_path: str | Path | None = None,
 ) -> AnalysisArtifact:
     with tempfile.TemporaryDirectory(prefix="econcheck-analysis-") as sandbox_dir:
         sandbox_path = Path(sandbox_dir)
@@ -53,9 +54,28 @@ def run_analysis_code(
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
+            _write_output_log(
+                output_log_path,
+                {
+                    "returncode": None,
+                    "stdout": _decode_timeout_output(exc.stdout),
+                    "stderr": _decode_timeout_output(exc.stderr),
+                    "timed_out": True,
+                },
+            )
             raise TimeoutError(
                 f"analysis code timed out after {timeout_seconds} seconds"
             ) from exc
+
+        _write_output_log(
+            output_log_path,
+            {
+                "returncode": completed.returncode,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+                "timed_out": False,
+            },
+        )
 
         if completed.returncode != 0:
             stderr = completed.stderr.strip()
@@ -82,6 +102,22 @@ def _artifact_to_dict(artifact: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise TypeError("data_artifact must serialize to a dict")
     return data
+
+
+def _write_output_log(output_log_path: str | Path | None, data: dict[str, Any]) -> None:
+    if output_log_path is None:
+        return
+    path = Path(output_log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _decode_timeout_output(value: bytes | str | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def _sandbox_environment(sandbox_path: Path) -> dict[str, str]:
