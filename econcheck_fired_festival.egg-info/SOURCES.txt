@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+econcheck_fired_festival.egg-info/PKG-INFO
+econcheck_fired_festival.egg-info/SOURCES.txt
+econcheck_fired_festival.egg-info/dependency_links.txt
+econcheck_fired_festival.egg-info/requires.txt
+econcheck_fired_festival.egg-info/top_level.txt
+harness/__init__.py
+tests/test_project_initialization.py
+workers/__init__.py
