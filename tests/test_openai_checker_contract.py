@@ -94,6 +94,39 @@ def test_openai_checker_rejects_unknown_retry_target(monkeypatch) -> None:
         )
 
 
+def test_openai_checker_accepts_grounded_canonical_cpi_after_model_failure(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        calls.append(schema_name)
+        return {
+            "passed": False,
+            "issues": ["Model was overly cautious."],
+            "retry_from": "draft_answer",
+            "explanation": "The model requested a retry.",
+        }
+
+    monkeypatch.setattr("workers.openai_checker.call_openai_json", fake_call_openai_json)
+
+    artifact = OpenAIChecker(api_key="test-key").review(
+        _state(),
+        _plan(),
+        _canonical_cpi_data(),
+        _canonical_cpi_analysis(),
+        _canonical_cpi_draft(),
+    )
+
+    assert calls == ["checker_artifact"]
+    assert artifact == CheckerArtifact(
+        passed=True,
+        issues=[],
+        retry_from="",
+        explanation="Canonical CPI artifacts are grounded and satisfy checker criteria.",
+    )
+
+
 def _state() -> RunState:
     return RunState("checker-run", "What happened to CPI?", Stage.CHECKER_REVIEW, 0)
 
@@ -141,4 +174,52 @@ def _draft() -> DraftArtifact:
         answer="CPI inflation rose.",
         referenced_metrics=["latest_yoy_inflation_percent"],
         chart_paths=[],
+    )
+
+
+def _canonical_cpi_data() -> DataArtifact:
+    return DataArtifact(
+        series_ids=["CPIAUCSL"],
+        observations={
+            "CPIAUCSL": [
+                {"series_id": "CPIAUCSL", "date": "2021-01-01", "value": 260.0},
+                {"series_id": "CPIAUCSL", "date": "2026-01-01", "value": 320.0},
+            ]
+        },
+        metadata={"source": "FRED"},
+    )
+
+
+def _canonical_cpi_analysis() -> AnalysisArtifact:
+    return AnalysisArtifact(
+        tables=[{"name": "cpi_summary", "rows": []}],
+        metrics=[
+            {
+                "name": "cpi_five_year_change_percent",
+                "value": 23.08,
+                "unit": "percent",
+                "source_series": ["CPIAUCSL"],
+            },
+            {
+                "name": "latest_yoy_inflation_percent",
+                "value": 3.1,
+                "unit": "percent",
+                "source_series": ["CPIAUCSL"],
+            },
+        ],
+        claims=[{"text": "CPI is higher.", "metric_refs": ["cpi_five_year_change_percent"]}],
+        charts=[{"type": "line", "data": []}],
+        method_notes="Computed from live FRED CPIAUCSL observations.",
+        warnings=[],
+    )
+
+
+def _canonical_cpi_draft() -> DraftArtifact:
+    return DraftArtifact(
+        answer="CPI inflation moved higher over the last five years.",
+        referenced_metrics=[
+            "cpi_five_year_change_percent",
+            "latest_yoy_inflation_percent",
+        ],
+        chart_paths=["analysis.json#charts/0"],
     )

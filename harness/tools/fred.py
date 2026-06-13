@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date
 import json
 import os
+import re
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -16,6 +17,8 @@ from workers.artifacts import DataArtifact
 
 FRED_BASE_URL = "https://api.stlouisfed.org/fred"
 DEFAULT_TIMEOUT_SECONDS = 20
+_EXPLICIT_SERIES_ID_PATTERN = re.compile(r"\b[A-Z][A-Z0-9_]{3,}\b")
+_NON_SERIES_TOKENS = {"FRED", "JSON", "HTTP", "HTTPS", "API"}
 
 
 class FredConfigurationError(RuntimeError):
@@ -68,7 +71,7 @@ def fred_search(
         timeout_seconds=timeout_seconds,
     )
 
-    return [
+    search_results = [
         SeriesSearchResult(
             series_id=str(item.get("id", "")),
             title=str(item.get("title", "")),
@@ -80,6 +83,15 @@ def fred_search(
         for item in payload.get("seriess", [])
         if item.get("id")
     ]
+    if search_results:
+        return search_results
+
+    return _direct_series_results(
+        search_text,
+        api_key=api_key,
+        limit=limit,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def fred_fetch(
@@ -176,6 +188,58 @@ def _request_json(
         message = payload.get("error_message", "Unknown FRED error.")
         raise FredToolError(f"FRED error {payload['error_code']}: {message}")
     return payload
+
+
+def _direct_series_results(
+    search_text: str,
+    *,
+    api_key: str,
+    limit: int,
+    timeout_seconds: float,
+) -> list[SeriesSearchResult]:
+    results: list[SeriesSearchResult] = []
+    seen_result_ids: set[str] = set()
+    for series_id in _explicit_series_ids(search_text)[:limit]:
+        try:
+            payload = _request_json(
+                "series",
+                {
+                    "api_key": api_key,
+                    "file_type": "json",
+                    "series_id": series_id,
+                },
+                timeout_seconds=timeout_seconds,
+            )
+        except FredToolError:
+            continue
+
+        for item in payload.get("seriess", []):
+            result_id = str(item.get("id", ""))
+            if result_id and result_id not in seen_result_ids:
+                seen_result_ids.add(result_id)
+                results.append(
+                    SeriesSearchResult(
+                        series_id=result_id,
+                        title=str(item.get("title", "")),
+                        frequency=str(item.get("frequency", "")),
+                        units=str(item.get("units", "")),
+                        observation_start=str(item.get("observation_start", "")),
+                        observation_end=str(item.get("observation_end", "")),
+                    )
+                )
+    return results
+
+
+def _explicit_series_ids(search_text: str) -> list[str]:
+    seen: set[str] = set()
+    series_ids: list[str] = []
+    for match in _EXPLICIT_SERIES_ID_PATTERN.findall(search_text):
+        series_id = match.upper()
+        if series_id in _NON_SERIES_TOKENS or series_id in seen:
+            continue
+        seen.add(series_id)
+        series_ids.append(series_id)
+    return series_ids
 
 
 def _observation_to_row(series_id: str, item: dict[str, Any]) -> dict[str, Any] | None:
