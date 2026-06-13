@@ -12,9 +12,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 try:
-    from .observability import load_run_view
+    from .observability import list_run_ids, load_run_view
 except ImportError:
-    from observability import load_run_view
+    from observability import list_run_ids, load_run_view
 
 from harness.orchestrator import Orchestrator
 from harness.state import RunState, Stage
@@ -60,6 +60,11 @@ def main() -> None:
     st.caption("Harness-aware economic analysis")
 
     with st.sidebar:
+        view_mode = st.radio("View", ["Chat", "Observability"])
+        if view_mode == "Observability":
+            _render_observability_page()
+            return
+
         st.header("Run configuration")
         worker_mode = st.selectbox("Worker mode", [MOCK_MODE, OPENAI_MODE])
         fred_api_key = st.text_input("FRED API key", type="password")
@@ -121,6 +126,59 @@ def main() -> None:
     with st.expander("Run artifacts"):
         st.write(f"Run ID: {run_id}")
         st.json(view.get("state") or {})
+
+
+def _render_observability_page() -> None:
+    st.header("Observability")
+    run_ids = list_run_ids(DEFAULT_RUNS_DIR)
+    if not run_ids:
+        st.info("No runs found yet. Run the harness from the Chat view first.")
+        return
+
+    default_index = len(run_ids) - 1
+    current_run_id = st.session_state.get("current_run_id")
+    if current_run_id in run_ids:
+        default_index = run_ids.index(current_run_id)
+
+    run_id = st.selectbox("Run", run_ids, index=default_index)
+    view = load_run_view(run_id, runs_dir=DEFAULT_RUNS_DIR)
+    artifacts = view.get("artifacts", {})
+
+    st.subheader("Run Summary")
+    state = view.get("state") or {}
+    st.write(
+        {
+            "run_id": run_id,
+            "current_stage": state.get("current_stage"),
+            "retry_count": state.get("retry_count"),
+        }
+    )
+
+    st.subheader("Timeline")
+    _render_progress(view)
+
+    st.subheader("Core Artifacts")
+    for artifact_name in [
+        "plan.json",
+        "fred_search.json",
+        "selected_data.json",
+        "data.json",
+        "generated_code.py",
+        "analysis.json",
+        "checkpoint_results.json",
+        "draft.json",
+        "checker.json",
+        "final_answer.json",
+        "alarms.json",
+    ]:
+        if artifact_name not in artifacts:
+            continue
+        with st.expander(artifact_name):
+            artifact = artifacts[artifact_name]
+            if isinstance(artifact, str):
+                st.code(artifact, language="python" if artifact_name.endswith(".py") else None)
+            else:
+                st.json(artifact)
 
 
 def _worker_pair(worker_mode: str, openai_api_key: str | None):
