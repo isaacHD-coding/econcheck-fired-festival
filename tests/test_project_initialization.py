@@ -25,10 +25,15 @@ class ProjectInitializationTests(unittest.TestCase):
                 self.assertTrue(path.is_file())
                 py_compile.compile(str(path), doraise=True)
 
-    def test_harness_and_workers_are_importable_packages(self) -> None:
-        for filename in ["harness/__init__.py", "workers/__init__.py"]:
+    def test_app_harness_and_workers_are_importable_packages(self) -> None:
+        for filename in ["app/__init__.py", "harness/__init__.py", "workers/__init__.py"]:
             with self.subTest(filename=filename):
                 self.assertTrue((ROOT / filename).is_file())
+
+    def test_observability_import_resolves_to_app_package(self) -> None:
+        from app.observability import load_run_view
+
+        self.assertTrue(callable(load_run_view))
 
     def test_project_declares_minimal_milestone_zero_dependencies(self) -> None:
         pyproject_path = ROOT / "pyproject.toml"

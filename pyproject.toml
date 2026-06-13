@@ -21,4 +21,4 @@ dev = [
 testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
-include = ["harness*", "workers*"]
+include = ["app*", "harness*", "workers*"]
