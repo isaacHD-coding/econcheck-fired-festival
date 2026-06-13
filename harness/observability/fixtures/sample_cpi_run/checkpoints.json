@@ -1,0 +1,44 @@
+[
+  {
+    "kind": "checkpoint",
+    "name": "PlannerSchemaGuardrail",
+    "stage": "planning",
+    "status": "passed",
+    "message": "Planner artifact includes all required fields."
+  },
+  {
+    "kind": "checkpoint",
+    "name": "SourceProvenanceCheckpoint",
+    "stage": "data_discovery",
+    "status": "passed",
+    "message": "Selected series is sourced from FRED."
+  },
+  {
+    "kind": "checkpoint",
+    "name": "DataCompletenessCheckpoint",
+    "stage": "data_discovery",
+    "status": "passed",
+    "message": "The selected CPI series covers the requested five-year window."
+  },
+  {
+    "kind": "checkpoint",
+    "name": "MathSanityCheckpoint",
+    "stage": "code_generation",
+    "status": "passed",
+    "message": "Computed inflation values are finite and plausible."
+  },
+  {
+    "kind": "checkpoint",
+    "name": "ChartPromiseCheckpoint",
+    "stage": "code_generation",
+    "status": "passed",
+    "message": "The analysis artifact includes a chart specification."
+  },
+  {
+    "kind": "checkpoint",
+    "name": "AnswerGroundingCheckpoint",
+    "stage": "draft_answer",
+    "status": "passed",
+    "message": "Draft answer references generated metrics."
+  }
+]

@@ -1,0 +1,27 @@
+{
+  "question_type": "trend",
+  "economic_concepts": [
+    "inflation",
+    "consumer price index",
+    "year-over-year change"
+  ],
+  "measurement_strategy": "Use the CPIAUCSL index to compute year-over-year inflation rates and compare recent inflation with the five-year path.",
+  "information_requirements": [
+    "Monthly CPI level for all urban consumers",
+    "Five years of observations",
+    "Year-over-year percent change"
+  ],
+  "search_queries": [
+    "consumer price index all urban consumers seasonally adjusted"
+  ],
+  "required_outputs": [
+    "Latest year-over-year inflation rate",
+    "Five-year CPI level change",
+    "Trend chart"
+  ],
+  "success_criteria": [
+    "Answer cites CPIAUCSL as the data source",
+    "Claims reference generated metrics",
+    "Chart shows the inflation path"
+  ]
+}

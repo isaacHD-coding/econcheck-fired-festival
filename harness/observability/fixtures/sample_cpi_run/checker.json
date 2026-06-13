@@ -1,0 +1,6 @@
+{
+  "passed": true,
+  "issues": [],
+  "retry_from": "draft_answer",
+  "explanation": "The draft answer is grounded in the generated CPI metrics and includes a chart-backed trend explanation."
+}

@@ -1,0 +1,10 @@
+{
+  "answer": "CPI inflation accelerated sharply after 2020, peaked during the 2021-2022 surge, and has since cooled but remains above the very low inflation rates seen before the surge. In this fixture run, the latest year-over-year CPI inflation metric is 3.4 percent, while the CPI price level is about 22.1 percent higher than five years earlier. The result is a story of a large price-level increase followed by slower, but still positive, inflation.",
+  "referenced_metrics": [
+    "latest_yoy_inflation",
+    "cpi_level_change_5y"
+  ],
+  "chart_paths": [
+    "analysis.charts[0]"
+  ]
+}

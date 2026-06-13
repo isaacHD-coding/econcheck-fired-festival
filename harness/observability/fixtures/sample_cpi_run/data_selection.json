@@ -1,0 +1,17 @@
+{
+  "selected_series": [
+    {
+      "series_id": "CPIAUCSL",
+      "title": "Consumer Price Index for All Urban Consumers: All Items in U.S. City Average",
+      "reason": "Primary all-items CPI series for measuring headline consumer price inflation."
+    }
+  ],
+  "rejected_series": [
+    {
+      "series_id": "CPILFESL",
+      "title": "Consumer Price Index for All Urban Consumers: All Items Less Food and Energy",
+      "reason": "Core CPI excludes food and energy, so it is not the best primary answer for headline CPI inflation."
+    }
+  ],
+  "justification": "CPIAUCSL is the headline, seasonally adjusted CPI series and directly supports the requested five-year inflation trend."
+}

@@ -1,0 +1,11 @@
+[
+  {
+    "kind": "alarm",
+    "type": "freshness_note",
+    "severity": "info",
+    "stage": "data_discovery",
+    "message": "Latest CPI observation depends on the current FRED release calendar.",
+    "recommended_action": "continue",
+    "retry_from": ""
+  }
+]
