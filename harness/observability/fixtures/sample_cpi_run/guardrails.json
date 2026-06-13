@@ -1,0 +1,30 @@
+[
+  {
+    "kind": "guardrail",
+    "name": "EconomicScopeGuardrail",
+    "stage": "input",
+    "status": "passed",
+    "message": "Question asks about CPI inflation and is in economic scope."
+  },
+  {
+    "kind": "guardrail",
+    "name": "FredAnswerableGuardrail",
+    "stage": "input",
+    "status": "passed",
+    "message": "The requested CPI trend can be answered from FRED data."
+  },
+  {
+    "kind": "guardrail",
+    "name": "PromptInjectionGuardrail",
+    "stage": "input",
+    "status": "passed",
+    "message": "No instruction attempts to override harness rules."
+  },
+  {
+    "kind": "guardrail",
+    "name": "ApprovedToolGuardrail",
+    "stage": "planning",
+    "status": "passed",
+    "message": "The plan uses only FRED search, FRED fetch, and analysis code."
+  }
+]

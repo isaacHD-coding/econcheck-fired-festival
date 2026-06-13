@@ -1,0 +1,44 @@
+[
+  {
+    "stage_id": "input_guardrails",
+    "label": "Input Guardrails",
+    "status": "complete",
+    "artifact_key": "guardrails",
+    "summary": "Question passed economic-scope and safety checks."
+  },
+  {
+    "stage_id": "planning",
+    "label": "Planning",
+    "status": "complete",
+    "artifact_key": "planner",
+    "summary": "Planner identified CPI inflation trend analysis."
+  },
+  {
+    "stage_id": "data_discovery",
+    "label": "Data Discovery",
+    "status": "complete",
+    "artifact_key": "data_selection",
+    "summary": "CPIAUCSL selected as the primary CPI series."
+  },
+  {
+    "stage_id": "code_generation",
+    "label": "Code Generation",
+    "status": "complete",
+    "artifact_key": "code",
+    "summary": "Analysis code computes year-over-year CPI inflation."
+  },
+  {
+    "stage_id": "draft_answer",
+    "label": "Draft Answer",
+    "status": "complete",
+    "artifact_key": "analysis",
+    "summary": "Metrics, claims, table, and chart were produced."
+  },
+  {
+    "stage_id": "release",
+    "label": "Release",
+    "status": "complete",
+    "artifact_key": "draft",
+    "summary": "Grounded answer is ready for the user."
+  }
+]

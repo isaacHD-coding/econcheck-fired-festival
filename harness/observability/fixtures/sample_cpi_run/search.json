@@ -1,0 +1,23 @@
+{
+  "queries": [
+    "consumer price index all urban consumers seasonally adjusted"
+  ],
+  "results": [
+    {
+      "series_id": "CPIAUCSL",
+      "title": "Consumer Price Index for All Urban Consumers: All Items in U.S. City Average",
+      "frequency": "Monthly",
+      "units": "Index 1982-1984=100",
+      "observation_start": "1947-01-01",
+      "observation_end": "2026-04-01"
+    },
+    {
+      "series_id": "CPILFESL",
+      "title": "Consumer Price Index for All Urban Consumers: All Items Less Food and Energy",
+      "frequency": "Monthly",
+      "units": "Index 1982-1984=100",
+      "observation_start": "1957-01-01",
+      "observation_end": "2026-04-01"
+    }
+  ]
+}

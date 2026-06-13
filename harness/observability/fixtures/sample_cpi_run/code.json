@@ -1,0 +1,3 @@
+{
+  "code": "import pandas as pd\n\ncpi = data['CPIAUCSL'].copy()\ncpi['date'] = pd.to_datetime(cpi['date'])\ncpi = cpi.sort_values('date')\ncpi['yoy_inflation'] = cpi['value'].pct_change(12) * 100\nlatest = cpi.dropna().iloc[-1]\nstart = cpi.iloc[-61]\nlevel_change = ((latest['value'] / start['value']) - 1) * 100\n\nresult = {\n    'metrics': [\n        {\n            'name': 'latest_yoy_inflation',\n            'value': round(float(latest['yoy_inflation']), 2),\n            'unit': 'percent',\n            'source_series': ['CPIAUCSL'],\n        },\n        {\n            'name': 'cpi_level_change_5y',\n            'value': round(float(level_change), 2),\n            'unit': 'percent',\n            'source_series': ['CPIAUCSL'],\n        },\n    ]\n}"
+}

@@ -1,0 +1,90 @@
+{
+  "tables": [
+    {
+      "title": "CPI inflation summary",
+      "rows": [
+        {
+          "metric": "Latest year-over-year CPI inflation",
+          "value": 3.4,
+          "unit": "percent"
+        },
+        {
+          "metric": "Five-year CPI level change",
+          "value": 22.1,
+          "unit": "percent"
+        }
+      ]
+    }
+  ],
+  "metrics": [
+    {
+      "name": "latest_yoy_inflation",
+      "value": 3.4,
+      "unit": "percent",
+      "source_series": [
+        "CPIAUCSL"
+      ]
+    },
+    {
+      "name": "cpi_level_change_5y",
+      "value": 22.1,
+      "unit": "percent",
+      "source_series": [
+        "CPIAUCSL"
+      ]
+    }
+  ],
+  "claims": [
+    {
+      "text": "CPI inflation rose sharply in 2021 and 2022, then cooled from its peak.",
+      "metric_refs": [
+        "latest_yoy_inflation"
+      ]
+    },
+    {
+      "text": "The CPI price level is materially higher than five years ago.",
+      "metric_refs": [
+        "cpi_level_change_5y"
+      ]
+    }
+  ],
+  "charts": [
+    {
+      "title": "CPI inflation, year-over-year",
+      "type": "line",
+      "x": "date",
+      "y": "value",
+      "unit": "percent",
+      "data": [
+        {
+          "date": "2021-01",
+          "value": 1.4
+        },
+        {
+          "date": "2022-01",
+          "value": 7.5
+        },
+        {
+          "date": "2023-01",
+          "value": 6.4
+        },
+        {
+          "date": "2024-01",
+          "value": 3.1
+        },
+        {
+          "date": "2025-01",
+          "value": 3.0
+        },
+        {
+          "date": "2026-04",
+          "value": 3.4
+        }
+      ]
+    }
+  ],
+  "method_notes": "Year-over-year inflation is calculated as the 12-month percent change in CPIAUCSL. The five-year change compares the latest CPI level to the level roughly 60 months earlier.",
+  "warnings": [
+    "Fixture values are representative development data, not live FRED output."
+  ]
+}
