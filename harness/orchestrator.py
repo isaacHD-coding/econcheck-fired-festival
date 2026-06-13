@@ -72,12 +72,29 @@ class Orchestrator:
         self._persist()
         return self.state
 
+    def route_alarm(self, alarm: Alarm) -> RunState:
+        if alarm.recommended_action == "retry":
+            return self.retry(alarm)
+        if alarm.recommended_action == "escalate":
+            return self.escalate(alarm)
+        if alarm.recommended_action == "abort":
+            return self.abort(alarm)
+
+        raise ValueError(f"Unknown alarm action: {alarm.recommended_action!r}")
+
     def release(self) -> RunState:
         self.state.current_stage = Stage.RELEASED
         self._persist()
         return self.state
 
     def escalate(self, alarm: Alarm | None = None) -> RunState:
+        if alarm is not None and alarm not in self.state.alarms:
+            self.state.alarms.append(alarm)
+        self.state.current_stage = Stage.ESCALATED
+        self._persist()
+        return self.state
+
+    def abort(self, alarm: Alarm | None = None) -> RunState:
         if alarm is not None and alarm not in self.state.alarms:
             self.state.alarms.append(alarm)
         self.state.current_stage = Stage.ESCALATED
