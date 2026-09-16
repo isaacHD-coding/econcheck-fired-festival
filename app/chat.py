@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 import sys
 from uuid import uuid4
@@ -7,15 +8,26 @@ from uuid import uuid4
 import streamlit as st
 
 from harness.config import load_env_files, resolve_fred_api_key, resolve_openai_api_key
+from app.chat_state import (
+    CURRENT_RUN_ID_KEY,
+    MOCK_MODE,
+    OPENAI_MODE,
+    QUESTION_KEY,
+    WORKER_MODE_KEY,
+    init_chat_state,
+    mark_run_finished,
+    mark_run_started,
+    reconcile_interrupted_run,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 try:
-    from .observability import list_run_ids, load_run_view
+    from .observability import load_run_view
 except ImportError:
-    from observability import list_run_ids, load_run_view
+    from observability import load_run_view
 
 from harness.orchestrator import Orchestrator
 from harness.state import RunState, Stage
@@ -26,9 +38,6 @@ from workers.openai_worker import OpenAIWorker
 
 
 DEFAULT_RUNS_DIR = Path("runs")
-MOCK_MODE = "Mock demo"
-OPENAI_MODE = "OpenAI agent"
-CANONICAL_QUESTION = "What has happened to CPI inflation over the last five years?"
 
 
 def run_question(
@@ -37,9 +46,12 @@ def run_question(
     fred_api_key: str | None = None,
     openai_api_key: str | None = None,
     worker_mode: str = MOCK_MODE,
+    run_id: str | None = None,
+    progress_callback: Callable[[str, str], None] | None = None,
+    deadline_seconds: float | None = None,
 ) -> str:
     load_env_files()
-    run_id = f"run-{uuid4().hex[:8]}"
+    run_id = run_id or f"run-{uuid4().hex[:8]}"
     state = RunState(
         run_id=run_id,
         question=question,
@@ -47,14 +59,17 @@ def run_question(
         retry_count=0,
     )
     worker, checker = _worker_pair(worker_mode, openai_api_key)
+    orchestrator_kwargs: dict = {
+        "runs_dir": runs_dir,
+        "worker": worker,
+        "checker": checker,
+        "fred_api_key": resolve_fred_api_key(fred_api_key),
+        "progress_callback": progress_callback,
+    }
+    if deadline_seconds is not None:
+        orchestrator_kwargs["deadline_seconds"] = deadline_seconds
     try:
-        Orchestrator(
-            state,
-            runs_dir=runs_dir,
-            worker=worker,
-            checker=checker,
-            fred_api_key=resolve_fred_api_key(fred_api_key),
-        ).run()
+        Orchestrator(state, **orchestrator_kwargs).run()
     except Exception:
         # The orchestrator persists alarms/state before failing; the UI loads them.
         pass
@@ -64,6 +79,7 @@ def run_question(
 def main() -> None:
     load_env_files()
     st.set_page_config(page_title="EconCheck", layout="wide")
+    init_chat_state(st.session_state)
     st.title("EconCheck")
     st.caption(
         "A governed harness for FRED economic questions. The worker proposes a plan; "
@@ -73,12 +89,13 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Run configuration")
-        worker_mode = st.selectbox("Worker mode", [MOCK_MODE, OPENAI_MODE])
+        worker_mode = st.selectbox("Worker mode", [MOCK_MODE, OPENAI_MODE], key=WORKER_MODE_KEY)
         env_fred_key = resolve_fred_api_key()
         env_openai_key = resolve_openai_api_key()
         fred_api_key = st.text_input(
             "FRED API key",
             type="password",
+            key="fred_api_key_input",
             help="Leave blank to use FRED_API_KEY from the environment, .env, or Streamlit secrets.",
         )
         openai_api_key = ""
@@ -86,18 +103,19 @@ def main() -> None:
             openai_api_key = st.text_input(
                 "OpenAI API key",
                 type="password",
+                key="openai_api_key_input",
                 help="Leave blank to use OPENAI_API_KEY from the environment, .env, or Streamlit secrets.",
             )
         if env_fred_key:
             st.caption("FRED API key loaded from environment or secrets.")
         if worker_mode == OPENAI_MODE and env_openai_key:
             st.caption("OpenAI API key loaded from environment or secrets.")
-        st.markdown("[Observability](./Observability)")
+        st.page_link("pages/2_Observability.py", label="Observability")
 
     st.header("Question")
     question = st.text_area(
         "Ask a FRED-answerable economics question",
-        value=CANONICAL_QUESTION,
+        key=QUESTION_KEY,
         height=96,
     )
 
@@ -118,19 +136,30 @@ def main() -> None:
         and (not needs_openai_api_key or has_openai_api_key)
     )
     if st.button("Run through harness", disabled=not can_run, type="primary"):
+        run_id = f"run-{uuid4().hex[:8]}"
+        mark_run_started(st.session_state, run_id)
         with st.status("Running harness", expanded=True) as status:
             st.write("Enforcing input guardrails and executing the FRED loop…")
-            run_id = run_question(
-                question,
-                fred_api_key=fred_api_key,
-                openai_api_key=openai_api_key,
-                worker_mode=worker_mode,
-            )
-            st.session_state.current_run_id = run_id
+
+            def progress(stage: str, message: str) -> None:
+                st.write(f"`{stage}` — {message}")
+
+            try:
+                run_question(
+                    question,
+                    fred_api_key=fred_api_key,
+                    openai_api_key=openai_api_key,
+                    worker_mode=worker_mode,
+                    run_id=run_id,
+                    progress_callback=progress,
+                )
+            finally:
+                mark_run_finished(st.session_state)
             view = load_run_view(run_id)
             stage = (view.get("state") or {}).get("current_stage", "unknown")
+            retries = (view.get("state") or {}).get("retry_count", 0)
             st.write(f"Run ID: `{run_id}`")
-            st.write(f"Final stage: `{stage}`")
+            st.write(f"Final stage: `{stage}` ({retries} retries)")
             if stage == "released":
                 status.update(label="Released an answer", state="complete")
             elif stage == "escalated":
@@ -138,7 +167,7 @@ def main() -> None:
             else:
                 status.update(label="Harness finished with an incomplete run", state="error")
 
-    run_id = st.session_state.get("current_run_id")
+    run_id = st.session_state.get(CURRENT_RUN_ID_KEY)
     if not run_id:
         st.info(
             "The canonical demo question is CPI over the last five years. Mock mode is "
@@ -151,6 +180,17 @@ def main() -> None:
     except FileNotFoundError:
         st.error(f"Run directory was not found for `{run_id}`.")
         return
+
+    state = view.get("state") or {}
+    if reconcile_interrupted_run(
+        st.session_state,
+        current_stage=state.get("current_stage"),
+    ):
+        st.warning(
+            "This run was interrupted (the chat page remounted while the harness was "
+            f"still in `{state.get('current_stage', 'unknown')}`). Latest persisted "
+            "artifacts are shown below."
+        )
 
     st.header("Harness Progress")
     _render_progress(view)
@@ -209,21 +249,32 @@ def _render_status(view: dict) -> None:
 
 def _render_progress(view: dict) -> None:
     artifacts = view.get("artifacts", {})
+    timeline = artifacts.get("timeline.json") or []
+    timeline_status = {
+        item.get("stage_id"): item.get("status")
+        for item in timeline
+        if isinstance(item, dict) and item.get("stage_id")
+    }
     stages = [
-        ("Input", "input.json"),
-        ("Guardrails", "guardrails.json"),
-        ("Plan", "plan.json"),
-        ("FRED", "fred_search.json"),
-        ("Data", "data.json"),
-        ("Code", "analysis.json"),
-        ("Checker", "checker.json"),
-        ("Release", "final_answer.json"),
+        ("Input", "input.json", "input_guardrails"),
+        ("Guardrails", "guardrails.json", "input_guardrails"),
+        ("Plan", "plan.json", "planning"),
+        ("FRED", "fred_search.json", "data_discovery"),
+        ("Data", "data.json", "data_discovery"),
+        ("Code", "analysis.json", "code_generation"),
+        ("Checker", "checker.json", "checker_review"),
+        ("Release", "final_answer.json", "release"),
     ]
     columns = st.columns(len(stages))
-    for column, (label, artifact_name) in zip(columns, stages):
-        available = artifact_name in artifacts
+    for column, (label, artifact_name, stage_id) in zip(columns, stages):
         column.markdown(f"**{label}**")
-        column.caption("Complete" if available else "Pending")
+        if artifact_name in artifacts:
+            caption = "Complete"
+        elif timeline_status.get(stage_id) == "in_progress":
+            caption = "In progress"
+        else:
+            caption = "Pending"
+        column.caption(caption)
 
 
 def _render_answer(view: dict) -> None:

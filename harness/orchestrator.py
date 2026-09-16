@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import time
 from typing import Any
 from pathlib import Path
 
@@ -52,6 +54,9 @@ RETRY_STAGES = {
     "draft_answer": Stage.DRAFT_ANSWER,
 }
 
+# Whole-run wall clock. OpenAI calls are separately capped at 45s with no SDK retries.
+DEFAULT_RUN_DEADLINE_SECONDS = 240.0
+
 
 class StageControl(Exception):
     """Interrupt the current stage after alarm routing."""
@@ -71,16 +76,26 @@ class Orchestrator:
         worker: Any | None = None,
         checker: Any | None = None,
         fred_api_key: str | None = None,
+        progress_callback: Callable[[str, str], None] | None = None,
+        deadline_seconds: float | None = DEFAULT_RUN_DEADLINE_SECONDS,
     ) -> None:
         self.state = state
         self.runs_dir = Path(runs_dir)
         self.worker = worker
         self.checker = checker
         self.fred_api_key = fred_api_key or None
+        self.progress_callback = progress_callback
+        self.deadline_seconds = deadline_seconds
+        self._deadline_at = (
+            None if deadline_seconds is None else time.monotonic() + deadline_seconds
+        )
+        self._loop_iterations = 0
+        self._max_loop_iterations = max(8, (state.max_turns + 1) * 8)
         self._checks: list[dict[str, Any]] = []
         self._guardrails: list[dict[str, Any]] = []
         self._timeline: list[dict[str, Any]] = []
         self._persist()
+        self._notify(state.current_stage.value, "Run started.")
 
     def run(self) -> RunState:
         if self.worker is not None:
@@ -184,7 +199,9 @@ class Orchestrator:
             return self.state
 
         while self.state.current_stage not in TERMINAL_STAGES:
+            self._loop_iterations += 1
             try:
+                self._raise_if_over_budget()
                 self._continue_from_current_stage(context)
             except StageControl as control:
                 if control.action != "retry" or self.state.current_stage in TERMINAL_STAGES:
@@ -304,6 +321,13 @@ class Orchestrator:
 
     def _planning_stage(self) -> PlannerArtifact:
         self._set_stage(Stage.PLANNING)
+        self._append_timeline(
+            "planning",
+            "Planning",
+            "in_progress",
+            "planner",
+            "Requesting a plan from the worker.",
+        )
         plan = self.worker.plan(self.state.question, self.state)
         plan = PlannerArtifact.from_dict(plan.to_dict())
         self._save_json_artifact("plan", plan)
@@ -326,6 +350,13 @@ class Orchestrator:
         plan: PlannerArtifact,
     ) -> tuple[dict[str, Any], DataSelectionArtifact, DataArtifact]:
         self._set_stage(Stage.DATA_DISCOVERY)
+        self._append_timeline(
+            "data_discovery",
+            "Data Discovery",
+            "in_progress",
+            "data_selection",
+            "Searching FRED and selecting series.",
+        )
 
         queries = []
         flattened_results: list[dict[str, Any]] = []
@@ -413,6 +444,13 @@ class Orchestrator:
         data: DataArtifact,
     ) -> AnalysisArtifact:
         self._set_stage(Stage.CODE_GENERATION)
+        self._append_timeline(
+            "code_generation",
+            "Code Generation",
+            "in_progress",
+            "code",
+            "Writing and executing analysis code.",
+        )
 
         code_artifact = self.worker.write_code(plan, data)
         code_artifact = CodeArtifact.from_dict(code_artifact.to_dict())
@@ -464,6 +502,13 @@ class Orchestrator:
         analysis: AnalysisArtifact,
     ) -> DraftArtifact:
         self._set_stage(Stage.DRAFT_ANSWER)
+        self._append_timeline(
+            "draft_answer",
+            "Draft Answer",
+            "in_progress",
+            "analysis",
+            "Drafting the user-facing answer.",
+        )
         draft = self.worker.draft_answer(plan, analysis)
         draft = DraftArtifact.from_dict(draft.to_dict())
         self._save_json_artifact("draft", draft)
@@ -697,6 +742,50 @@ class Orchestrator:
         if self._checks:
             self._save_json_artifact("checkpoint_results", {"checks": self._checks})
         self._persist()
+        self._notify(stage.value, f"Entered {stage.value}.")
+        self._raise_if_over_budget()
+
+    def _notify(self, stage: str, message: str) -> None:
+        if self.progress_callback is None:
+            return
+        try:
+            self.progress_callback(stage, message)
+        except Exception:
+            return
+
+    def _raise_if_over_budget(self) -> None:
+        if self._loop_iterations > self._max_loop_iterations:
+            self._fail_with_alarm(
+                type="run_iteration_limit",
+                message=(
+                    f"Run exceeded the stage-loop cap ({self._max_loop_iterations} "
+                    "iterations) and was stopped instead of spinning forever."
+                ),
+                context={
+                    "loop_iterations": self._loop_iterations,
+                    "max_loop_iterations": self._max_loop_iterations,
+                    "retry_count": self.state.retry_count,
+                    "max_turns": self.state.max_turns,
+                },
+                retry_from=self._retry_from_current_stage(),
+                recommended_action="escalate",
+            )
+        if self._deadline_at is not None and time.monotonic() >= self._deadline_at:
+            limit = self.deadline_seconds if self.deadline_seconds is not None else 0
+            self._fail_with_alarm(
+                type="run_deadline_exceeded",
+                message=(
+                    f"Run exceeded the {limit:.0f}s wall-clock limit and was "
+                    "stopped instead of hanging."
+                ),
+                context={
+                    "deadline_seconds": self.deadline_seconds,
+                    "current_stage": self.state.current_stage.value,
+                    "retry_count": self.state.retry_count,
+                },
+                retry_from=self._retry_from_current_stage(),
+                recommended_action="escalate",
+            )
 
     def _save_json_artifact(self, name: str, artifact: Any) -> Path:
         path = save_artifact(self.state.run_id, name, artifact, self.runs_dir)

@@ -70,6 +70,7 @@ def main() -> None:
     st.set_page_config(page_title="EconCheck Observability", layout="wide")
     st.title("Observability")
     st.caption("Read-only reconstruction of harness runs from persisted artifacts.")
+    st.page_link("app.py", label="Back to chat")
 
     run_ids = list_run_ids()
     if not run_ids:
@@ -81,7 +82,7 @@ def main() -> None:
     if current_run_id in run_ids:
         default_index = run_ids.index(current_run_id)
 
-    run_id = st.selectbox("Run", run_ids, index=default_index)
+    run_id = st.selectbox("Run", run_ids, index=default_index, key="observability_selected_run")
     view = load_run_view(run_id)
     artifacts = view.get("artifacts", {})
     state = view.get("state") or {}

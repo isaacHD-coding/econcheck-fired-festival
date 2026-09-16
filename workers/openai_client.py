@@ -9,6 +9,10 @@ from harness.config import resolve_openai_api_key as _resolve_openai_api_key
 
 
 DEFAULT_OPENAI_MODEL = "gpt-5.5"
+# Harness owns retries. The SDK default (2 retries × 10-minute timeout) can
+# look like a hang in planning.
+DEFAULT_OPENAI_TIMEOUT_SECONDS = 45.0
+DEFAULT_OPENAI_MAX_RETRIES = 0
 
 
 class OpenAIClientError(RuntimeError):
@@ -34,6 +38,8 @@ def call_openai_json(
     input_payload: dict[str, Any],
     api_key: str | None = None,
     model: str = DEFAULT_OPENAI_MODEL,
+    timeout_seconds: float = DEFAULT_OPENAI_TIMEOUT_SECONDS,
+    max_retries: int = DEFAULT_OPENAI_MAX_RETRIES,
 ) -> dict[str, Any]:
     """Call the Responses API and parse strict structured JSON output."""
 
@@ -46,7 +52,11 @@ def call_openai_json(
             "before using the OpenAI agent."
         ) from exc
 
-    client = OpenAI(api_key=resolved_api_key)
+    client = OpenAI(
+        api_key=resolved_api_key,
+        timeout=timeout_seconds,
+        max_retries=max_retries,
+    )
     try:
         response = client.responses.create(
             model=model,

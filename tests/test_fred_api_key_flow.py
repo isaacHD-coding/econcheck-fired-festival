@@ -88,6 +88,7 @@ def test_run_question_passes_explicit_fred_api_key_to_orchestrator(
             worker,
             checker,
             fred_api_key: str | None = None,
+            **kwargs,
         ) -> None:
             captured["state"] = state
             captured["runs_dir"] = runs_dir
