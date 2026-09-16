@@ -151,6 +151,12 @@ def requested_window_years(question: str, plan: Any = None) -> int:
     return DEFAULT_REQUESTED_WINDOW_YEARS
 
 
+def requested_yoy_months(question: str, plan: Any = None) -> int:
+    """Monthly YoY observations to keep after inner-join for an N-year ask."""
+
+    return requested_window_years(question, plan) * 12
+
+
 def needs_yoy_raw_history(question: str, plan: Any = None) -> bool:
     """True when N years of inflation rates / YoY need more than N years of levels."""
 

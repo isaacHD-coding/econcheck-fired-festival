@@ -10,6 +10,7 @@ from harness.domain import (
     plan_requests_relationship,
     raw_history_years,
     requested_window_years,
+    requested_yoy_months,
     wanted_series_for_question,
     years_ago,
 )
@@ -66,6 +67,7 @@ def test_plan_requests_relationship_detects_gdp_and_inflation() -> None:
 def test_cpi_pce_last_five_years_fetches_at_least_six_years_of_raw_history() -> None:
     today = date.today()
     assert requested_window_years(CPI_PCE_QUESTION) == 5
+    assert requested_yoy_months(CPI_PCE_QUESTION) == 60
     assert needs_yoy_raw_history(CPI_PCE_QUESTION) is True
     assert raw_history_years(CPI_PCE_QUESTION) >= 6
     start = observation_start_for_fetch(CPI_PCE_QUESTION, today=today)

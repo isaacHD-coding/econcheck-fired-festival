@@ -32,6 +32,7 @@ from harness.domain import (
     observation_start_for_fetch,
     raw_history_years,
     requested_window_years,
+    requested_yoy_months,
 )
 from harness.guardrails import INPUT_GUARDRAILS, PLANNING_GUARDRAILS
 from harness.persistence import save_artifact, save_run_state, save_text_artifact
@@ -472,6 +473,10 @@ class Orchestrator:
         data.metadata["selected_series"] = selection.selected_series
         data.metadata["observation_start"] = self._last_fetch_observation_start
         data.metadata["requested_window_years"] = requested_window_years(
+            self.state.question,
+            plan,
+        )
+        data.metadata["requested_yoy_months"] = requested_yoy_months(
             self.state.question,
             plan,
         )

@@ -627,6 +627,44 @@ def test_comparison_draft_does_not_call_short_window_a_five_year_average() -> No
     assert "2026-07" in draft.answer
     assert "46" in draft.answer
     assert "not a five-year average" in lowered
+    assert "basket" in lowered
+    assert "weight" in lowered
+    assert "formula" in lowered or "substitution" in lowered
+
+
+def test_comparison_template_trims_yoy_window_to_requested_five_years() -> None:
+    from workers.analysis_templates import comparison_analysis_code, comparison_draft
+
+    data = _cpi_and_pce_long_history()
+    analysis = run_analysis_code(
+        CodeArtifact(code=comparison_analysis_code()),
+        data,
+    )
+
+    window, expected_gaps, full_gaps = _expected_calendar_yoy_window(data, months=60)
+    chart_dates = [str(row["date"])[:7] for row in analysis.charts[0]["data"]]
+    overlap = next(m["value"] for m in analysis.metrics if m["name"] == "overlap_periods")
+    avg_gap = next(m["value"] for m in analysis.metrics if m["name"] == "average_yoy_gap_percent")
+
+    assert len(full_gaps) > 60
+    assert overlap == 60
+    assert len(chart_dates) == 60
+    assert chart_dates[0] == window[0]
+    assert chart_dates[-1] == window[-1]
+    assert chart_dates[-1] == "2026-07"
+    assert abs(float(avg_gap) - (sum(expected_gaps) / len(expected_gaps))) < 0.02
+    assert abs((sum(full_gaps) / len(full_gaps)) - float(avg_gap)) > 0.01
+    assert "trimmed" in analysis.method_notes.lower()
+    assert "last five years" in analysis.method_notes.lower()
+
+    draft = comparison_draft(analysis)
+    lowered = draft.answer.lower()
+    assert "last five years" in lowered
+    assert "60" in draft.answer
+    assert window[0] in draft.answer
+    assert "2026-07" in draft.answer
+    assert "basket" in lowered
+    assert "weight" in lowered
 
 
 def test_comparison_template_uses_calendar_yoy_when_a_month_is_missing() -> None:
@@ -718,6 +756,8 @@ def test_write_code_guidance_keeps_generated_scripts_short() -> None:
     assert "calendar" in lowered
     assert "positional" in lowered
     assert "inner-join" in lowered or "inner join" in lowered
+    assert "60 months" in lowered
+    assert "filtered window" in lowered or "requested window" in lowered
     assert "adaptive chart design" not in lowered
     assert "correlation is acceptable" not in lowered
 
@@ -929,6 +969,68 @@ def _cpi_and_pce_data() -> DataArtifact:
         observations={"CPIAUCSL": cpi_rows, "PCEPI": pce_rows},
         metadata={"source": "FRED"},
     )
+
+
+def _cpi_and_pce_long_history() -> DataArtifact:
+    """83 monthly levels (2019-09..2026-07) so YoY overlap exceeds 60 months."""
+
+    cpi_rows = []
+    pce_rows = []
+    year, month = 2019, 9
+    for index in range(83):
+        date = f"{year:04d}-{month:02d}-01"
+        extra = 30.0 if year < 2021 else 0.0
+        cpi_rows.append(
+            {
+                "series_id": "CPIAUCSL",
+                "date": date,
+                "value": round(200.0 + index + extra, 3),
+            }
+        )
+        pce_rows.append(
+            {
+                "series_id": "PCEPI",
+                "date": date,
+                "value": round(100.0 + index * 0.5, 3),
+            }
+        )
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return DataArtifact(
+        series_ids=["CPIAUCSL", "PCEPI"],
+        observations={"CPIAUCSL": cpi_rows, "PCEPI": pce_rows},
+        metadata={
+            "source": "FRED",
+            "requested_window_years": 5,
+            "requested_yoy_months": 60,
+        },
+    )
+
+
+def _expected_calendar_yoy_window(
+    data: DataArtifact, months: int = 60
+) -> tuple[list[str], list[float], list[float]]:
+    left = {row["date"][:7]: float(row["value"]) for row in data.observations["CPIAUCSL"]}
+    right = {row["date"][:7]: float(row["value"]) for row in data.observations["PCEPI"]}
+
+    def yoy(levels: dict[str, float]) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for key, value in levels.items():
+            prior_key = f"{int(key[:4]) - 1:04d}-{key[5:7]}"
+            prior = levels.get(prior_key)
+            if prior:
+                out[key] = ((value / prior) - 1.0) * 100.0
+        return out
+
+    left_yoy = yoy(left)
+    right_yoy = yoy(right)
+    common = sorted(set(left_yoy) & set(right_yoy))
+    full_gaps = [left_yoy[key] - right_yoy[key] for key in common]
+    window = common[-months:]
+    gaps = [left_yoy[key] - right_yoy[key] for key in window]
+    return window, gaps, full_gaps
 
 
 def _cpi_and_pce_data_with_missing_month() -> DataArtifact:

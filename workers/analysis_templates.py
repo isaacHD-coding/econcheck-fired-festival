@@ -444,6 +444,18 @@ right_yoy = calendar_yoy(right_levels)
 common = sorted(set(left_yoy) & set(right_yoy))
 if len(common) < 8:
     raise RuntimeError("Not enough overlapping calendar year-over-year months.")
+meta = input_data.get("metadata") or {}
+try:
+    analysis_months = int(meta.get("requested_yoy_months") or 0)
+    if analysis_months <= 0:
+        analysis_months = int(meta.get("requested_window_years") or 5) * 12
+except (TypeError, ValueError):
+    analysis_months = 60
+if analysis_months < 8:
+    analysis_months = 60
+available_n = len(common)
+if available_n > analysis_months:
+    common = common[-analysis_months:]
 
 yoy_rows = []
 gaps = []
@@ -478,7 +490,15 @@ window_note = (
     + " to "
     + yoy_end
 )
-if overlap_n < 60:
+if available_n > overlap_n:
+    window_note += (
+        "; trimmed from "
+        + str(available_n)
+        + " overlapping YoY months to the requested analysis window ending at the latest common month"
+    )
+if overlap_n >= 60:
+    window_note += " (last five years of YoY)"
+else:
     window_note += (
         "; shorter than five years of YoY, so the average gap is not a five-year average"
     )
@@ -655,15 +675,17 @@ def comparison_draft(analysis: AnalysisArtifact) -> DraftArtifact:
         overlap_months = None
     if isinstance(avg_gap.get("value"), (int, float)):
         gap_txt = f"{round(float(avg_gap['value']), 2)} percentage points"
-        if overlap_months is not None and overlap_months >= 60:
-            avg_bit = f" Over the last five years the average gap was about {gap_txt}."
-        elif window_start and window_end:
+        span = ""
+        if window_start and window_end:
             month_bit = (
                 f", {overlap_months} months" if overlap_months is not None else ""
             )
+            span = f" ({window_start[:7]} to {window_end[:7]}{month_bit})"
+        if overlap_months is not None and overlap_months >= 60:
+            avg_bit = f" Over the last five years{span} the average gap was about {gap_txt}."
+        elif span:
             avg_bit = (
-                f" Over the overlapping year-over-year window "
-                f"({window_start[:7]} to {window_end[:7]}{month_bit}) "
+                f" Over the overlapping year-over-year window{span} "
                 f"the average gap was about {gap_txt}."
             )
             if overlap_months is not None and overlap_months < 60:
@@ -675,8 +697,15 @@ def comparison_draft(analysis: AnalysisArtifact) -> DraftArtifact:
     overlap_bit = (
         f" over {overlap_n} overlapping periods" if overlap_n is not None else ""
     )
+    conceptual = (
+        "CPI and PCE inflation can differ because they cover different baskets of "
+        "goods and services, use different weights, and are calculated with different "
+        "formulas. CPI follows urban consumers with a more fixed basket; PCE covers "
+        "a broader set of spending and allows more substitution when relative prices change."
+    )
     answer = (
         f"{lead}{avg_bit}\n\n"
+        f"{conceptual}\n\n"
         f"{_sentence_name(left_name)} ({left}) and {right_name} ({right}) "
         "are the FRED series used here.\n\n"
         f"The comparison uses calendar year-over-year percent changes{overlap_bit} "
