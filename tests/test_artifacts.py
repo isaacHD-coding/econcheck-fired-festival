@@ -4,6 +4,7 @@ import unittest
 from workers.artifacts import (
     AnalysisArtifact,
     ArtifactValidationError,
+    ChartBriefArtifact,
     CheckerArtifact,
     CodeArtifact,
     DataSelectionArtifact,
@@ -93,6 +94,39 @@ class ArtifactTests(unittest.TestCase):
             retry_from="planning",
             explanation="Schema only.",
         )
+        ChartBriefArtifact(
+            claim="CPI all items (CPIAUCSL) changed over five years.",
+            series_ids=["CPIAUCSL"],
+            transforms=["levels"],
+            layout="single",
+            y_starts_at_zero=False,
+            time_window_rationale="Fetched five-year window.",
+            annotations=[],
+            title="CPI all items (CPIAUCSL)",
+            x_label="date",
+            y_label="index",
+            units="index 1982-1984=100",
+            notes="Single-series levels chart.",
+            chart_type="line",
+        )
+
+    def test_chart_brief_rejects_invalid_layout(self) -> None:
+        with self.assertRaisesRegex(ArtifactValidationError, "layout"):
+            ChartBriefArtifact(
+                claim="Bad layout",
+                series_ids=["CPIAUCSL"],
+                transforms=["levels"],
+                layout="spaghetti",
+                y_starts_at_zero=False,
+                time_window_rationale="window",
+                annotations=[],
+                title="Bad",
+                x_label="date",
+                y_label="index",
+                units="index",
+                notes="notes",
+                chart_type="line",
+            )
 
 
 if __name__ == "__main__":

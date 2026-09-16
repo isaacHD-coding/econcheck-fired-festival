@@ -5,13 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 import json
-import os
 import re
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from harness.config import resolve_fred_api_key
 from workers.artifacts import DataArtifact
 
 
@@ -258,12 +258,11 @@ def _observation_to_row(series_id: str, item: dict[str, Any]) -> dict[str, Any] 
 
 
 def _require_api_key(api_key: str | None) -> str:
-    resolved = api_key or os.environ.get("FRED_API_KEY")
+    resolved = resolve_fred_api_key(api_key)
     if not resolved:
         raise FredConfigurationError(
-            "FRED_API_KEY not configured. "
-            "Milestone 17 requires live FRED integration. "
-            "Set FRED_API_KEY and rerun."
+            "FRED_API_KEY is not configured. Set FRED_API_KEY in your environment, "
+            "a local .env file, or Streamlit secrets, then rerun."
         )
     return resolved
 

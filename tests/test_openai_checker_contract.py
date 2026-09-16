@@ -11,7 +11,8 @@ from workers.artifacts import (
     DraftArtifact,
     PlannerArtifact,
 )
-from workers.openai_checker import OpenAIChecker, OpenAICheckerError
+from workers.openai_checker import OpenAIChecker, OpenAICheckerError, OpenAICheckerTimeoutError
+from workers.openai_client import OPENAI_CHECKER_TIMEOUT_SECONDS, OpenAITimeoutError
 
 
 def test_openai_checker_accepts_passing_review(monkeypatch) -> None:
@@ -94,6 +95,29 @@ def test_openai_checker_rejects_unknown_retry_target(monkeypatch) -> None:
         )
 
 
+def test_openai_checker_timeout_raises_friendly_error(monkeypatch) -> None:
+    def fake_call_openai_json(**kwargs):
+        raise OpenAITimeoutError(
+            "checker_artifact",
+            OPENAI_CHECKER_TIMEOUT_SECONDS,
+            stage_label="review",
+        )
+
+    monkeypatch.setattr("workers.openai_checker.call_openai_json", fake_call_openai_json)
+
+    with pytest.raises(OpenAICheckerTimeoutError, match="Review took longer than 30") as err:
+        OpenAIChecker(api_key="test-key").review(
+            _state(),
+            _plan(),
+            _data(),
+            _analysis(),
+            _draft(),
+        )
+
+    assert "did not match" not in str(err.value)
+    assert err.value.timeout_seconds == OPENAI_CHECKER_TIMEOUT_SECONDS
+
+
 def test_openai_checker_accepts_grounded_canonical_cpi_after_model_failure(
     monkeypatch,
 ) -> None:
@@ -127,8 +151,53 @@ def test_openai_checker_accepts_grounded_canonical_cpi_after_model_failure(
     )
 
 
+def test_openai_checker_does_not_force_pass_relationship_question(
+    monkeypatch,
+) -> None:
+    def fake_call_openai_json(**kwargs):
+        return {
+            "passed": False,
+            "issues": ["Answer ignored GDP."],
+            "retry_from": "draft_answer",
+            "explanation": "Retry.",
+        }
+
+    monkeypatch.setattr("workers.openai_checker.call_openai_json", fake_call_openai_json)
+
+    state = RunState(
+        "checker-run",
+        "What is the correlation (or anti correlation) between inflation and real GDP growth?",
+        Stage.CHECKER_REVIEW,
+        0,
+    )
+    data = DataArtifact(
+        series_ids=["CPIAUCSL", "GDPC1"],
+        observations={
+            "CPIAUCSL": [{"series_id": "CPIAUCSL", "date": "2026-01-01", "value": 320.0}],
+            "GDPC1": [{"series_id": "GDPC1", "date": "2026-01-01", "value": 23000.0}],
+        },
+        metadata={"source": "FRED"},
+    )
+
+    artifact = OpenAIChecker(api_key="test-key").review(
+        state,
+        _plan(),
+        data,
+        _canonical_cpi_analysis(),
+        _canonical_cpi_draft(),
+    )
+
+    assert artifact.passed is False
+    assert artifact.retry_from == "draft_answer"
+
+
 def _state() -> RunState:
-    return RunState("checker-run", "What happened to CPI?", Stage.CHECKER_REVIEW, 0)
+    return RunState(
+        "checker-run",
+        "What has happened to CPI inflation over the last five years?",
+        Stage.CHECKER_REVIEW,
+        0,
+    )
 
 
 def _plan() -> PlannerArtifact:

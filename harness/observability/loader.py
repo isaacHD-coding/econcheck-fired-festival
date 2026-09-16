@@ -54,15 +54,12 @@ def load_run_artifacts(
     run_id: str,
     mode: LoadMode = "fixture",
     fixture_root: str | Path = DEFAULT_FIXTURE_ROOT,
+    runs_dir: str | Path = "runs",
 ) -> RunArtifacts:
-    """Load one run from fixture artifacts.
-
-    The ``runs`` mode is intentionally a seam only. Runtime persistence is owned
-    by another thread, so this branch does not read or write real run output.
-    """
+    """Load one run from fixture artifacts or persisted live runs."""
 
     if mode == "runs":
-        raise NotImplementedError("Real run loading is a future integration seam.")
+        return _load_live_run(run_id, Path(runs_dir))
     if mode != "fixture":
         raise ValueError(f"Unsupported observability load mode: {mode!r}")
 
@@ -95,13 +92,82 @@ def load_run_artifacts(
     )
 
 
+def _load_live_run(run_id: str, runs_dir: Path) -> RunArtifacts:
+    run_dir = runs_dir / run_id
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"Run directory not found: {run_dir}")
+
+    def read(name: str, default: Any) -> Any:
+        path = run_dir / name
+        if not path.is_file():
+            return default
+        if path.suffix == ".json":
+            return json.loads(path.read_text(encoding="utf-8"))
+        return path.read_text(encoding="utf-8")
+
+    checkpoints_payload = read("checkpoint_results.json", {"checks": []})
+    if isinstance(checkpoints_payload, dict):
+        checkpoints = list(checkpoints_payload.get("checks") or [])
+    elif isinstance(checkpoints_payload, list):
+        checkpoints = checkpoints_payload
+    else:
+        checkpoints = []
+
+    generated_code = read("generated_code.py", "")
+    code = generated_code if isinstance(generated_code, dict) else {"code": generated_code}
+    draft = read("draft.json", {}) or read("final_answer.json", {})
+
+    raw = {
+        "input": read("input.json", {}),
+        "timeline": read("timeline.json", []),
+        "guardrails": read("guardrails.json", []),
+        "checkpoints": checkpoints,
+        "alarms": read("alarms.json", []),
+        "planner": read("plan.json", {}),
+        "search": read("fred_search.json", {}),
+        "data_selection": read("selected_data.json", {}),
+        "code": code,
+        "analysis": read("analysis.json", {}),
+        "chart_brief": read("chart_brief.json", {}),
+        "draft": draft,
+        "checker": read("checker.json", {}),
+        "state": read("state.json", {}),
+        "final_answer": read("final_answer.json", {}),
+    }
+
+    return RunArtifacts(
+        run_id=run_id,
+        source="runs",
+        root_path=run_dir,
+        input=_as_dict(raw["input"]),
+        timeline=_list_of_dicts(raw["timeline"], "timeline", strict=False),
+        guardrails=_list_of_dicts(raw["guardrails"], "guardrails", strict=False),
+        checkpoints=_list_of_dicts(raw["checkpoints"], "checkpoints", strict=False),
+        alarms=_list_of_dicts(raw["alarms"], "alarms", strict=False),
+        planner=_as_dict(raw["planner"]),
+        search=_as_dict(raw["search"]),
+        data_selection=_as_dict(raw["data_selection"]),
+        code=_as_dict(raw["code"]),
+        analysis=_as_dict(raw["analysis"]),
+        draft=_as_dict(raw["draft"]),
+        checker=_as_dict(raw["checker"]),
+        raw=raw,
+    )
+
+
 def _read_json(path: Path) -> Any:
     if not path.is_file():
         raise FileNotFoundError(f"Missing observability artifact: {path.name}")
     return json.loads(path.read_text())
 
 
-def _list_of_dicts(value: Any, artifact_name: str) -> list[dict[str, Any]]:
+def _as_dict(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _list_of_dicts(value: Any, artifact_name: str, *, strict: bool = True) -> list[dict[str, Any]]:
     if not isinstance(value, list):
-        raise ValueError(f"{artifact_name} must be a list")
-    return [dict(item) for item in value]
+        if strict:
+            raise ValueError(f"{artifact_name} must be a list")
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]

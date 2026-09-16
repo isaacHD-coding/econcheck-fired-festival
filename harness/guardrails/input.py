@@ -101,18 +101,65 @@ class FredAnswerableGuardrail:
         )
 
 
+INJECTION_PATTERNS = (
+    "ignore previous instructions",
+    "ignore all previous",
+    "disregard previous",
+    "disregard all previous",
+    "you are now",
+    "reveal your system prompt",
+    "show your system prompt",
+    "override the harness",
+    "jailbreak",
+    "new instructions:",
+    "system prompt:",
+)
+
+SECURITY_PATTERNS = (
+    "print your api key",
+    "dump secrets",
+    "read the .env",
+    "cat /etc/passwd",
+    "exfiltrate",
+)
+
+
 class PromptInjectionGuardrail:
-    """Stub guardrail reserved for prompt-injection detection."""
+    """Block obvious attempts to override harness instructions."""
 
     def evaluate(self, question: str) -> GuardrailResult:
-        return GuardrailResult.pass_result("Prompt injection stub passed.")
+        text = _normalize(question)
+        matched = [pattern for pattern in INJECTION_PATTERNS if pattern in text]
+        if matched:
+            return GuardrailResult.fail_result(
+                guardrail_name=self.__class__.__name__,
+                stage="input",
+                message="Question attempts to override harness instructions.",
+                recommended_action="escalate",
+                severity="critical",
+                context={"question": question, "matched_patterns": matched},
+            )
+
+        return GuardrailResult.pass_result("No prompt-injection patterns detected.")
 
 
 class DataSecurityGuardrail:
-    """Stub guardrail reserved for data-security checks."""
+    """Block obvious attempts to exfiltrate secrets or local files."""
 
     def evaluate(self, question: str) -> GuardrailResult:
-        return GuardrailResult.pass_result("Data security stub passed.")
+        text = _normalize(question)
+        matched = [pattern for pattern in SECURITY_PATTERNS if pattern in text]
+        if matched:
+            return GuardrailResult.fail_result(
+                guardrail_name=self.__class__.__name__,
+                stage="input",
+                message="Question requests secrets or local files outside FRED scope.",
+                recommended_action="escalate",
+                severity="critical",
+                context={"question": question, "matched_patterns": matched},
+            )
+
+        return GuardrailResult.pass_result("No data-security violations detected.")
 
 
 def _normalize(value: str) -> str:

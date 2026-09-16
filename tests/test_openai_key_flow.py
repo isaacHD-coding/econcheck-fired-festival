@@ -28,7 +28,7 @@ def test_run_question_passes_openai_key_to_openai_worker_and_checker(
             captured["checker_model"] = model
 
     class FakeOrchestrator:
-        def __init__(self, state, runs_dir, worker, checker, fred_api_key=None) -> None:
+        def __init__(self, state, runs_dir, worker, checker, fred_api_key=None, **kwargs) -> None:
             captured["fred_api_key"] = fred_api_key
             self.state = state
             self.runs_dir = Path(runs_dir)

@@ -49,3 +49,16 @@ def test_streamlit_helpers_avoid_deprecated_container_width_parameter() -> None:
     helper_source = (ROOT / "harness" / "observability" / "streamlit_ui.py").read_text()
 
     assert "use_container_width" not in helper_source
+
+
+def test_chat_uses_page_link_so_observability_navigation_keeps_session() -> None:
+    chat_source = (ROOT / "app" / "chat.py").read_text()
+    observability_source = (ROOT / "app" / "observability.py").read_text()
+
+    assert "st.page_link" in chat_source
+    assert "[Observability](./Observability)" not in chat_source
+    assert "st.page_link" in observability_source
+    assert "key=QUESTION_KEY" in chat_source
+    assert "CURRENT_RUN_ID_KEY" in chat_source
+    assert "mark_run_started" in chat_source
+

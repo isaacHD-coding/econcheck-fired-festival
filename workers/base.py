@@ -7,6 +7,7 @@ from typing import Protocol, runtime_checkable
 from harness.state import RunState
 from workers.artifacts import (
     AnalysisArtifact,
+    ChartBriefArtifact,
     CodeArtifact,
     DataSelectionArtifact,
     DraftArtifact,
@@ -30,10 +31,18 @@ class Worker(Protocol):
     ) -> DataSelectionArtifact:
         ...
 
+    def design_chart(
+        self,
+        plan: PlannerArtifact,
+        data_summary: "DataArtifact",
+    ) -> ChartBriefArtifact:
+        ...
+
     def write_code(
         self,
         plan: PlannerArtifact,
         data_summary: "DataArtifact",
+        chart_brief: ChartBriefArtifact | None = None,
     ) -> CodeArtifact:
         ...
 

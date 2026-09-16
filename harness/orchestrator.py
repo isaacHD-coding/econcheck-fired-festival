@@ -1,25 +1,59 @@
-"""Orchestrator skeleton for EconCheck run control."""
+"""Orchestrator for EconCheck run control."""
 
 from __future__ import annotations
 
-from datetime import date, datetime
-import math
-from pathlib import Path
+from collections.abc import Callable
+import inspect
+import time
 from typing import Any
+from pathlib import Path
 
 from harness.alarms import Alarm
+from harness.checkpoints import (
+    AnswerGroundingCheckpoint,
+    ChartBriefCheckpoint,
+    ChartHonestyCheckpoint,
+    ChartLabelCheckpoint,
+    ChartPromiseCheckpoint,
+    CodeExecutionCheckpoint,
+    CodeSimplicityCheckpoint,
+    DataCompletenessCheckpoint,
+    FreshnessCheckpoint,
+    InformationSufficiencyCheckpoint,
+    MathSanityCheckpoint,
+    OutputShapeCheckpoint,
+    SourceProvenanceCheckpoint,
+    SuccessCriteriaCheckpoint,
+)
+from harness.domain import (
+    CPI_PCE_SERIES,
+    is_comparison_question,
+    needs_yoy_raw_history,
+    observation_start_for_fetch,
+    raw_history_years,
+    requested_window_years,
+    requested_yoy_months,
+)
+from harness.guardrails import INPUT_GUARDRAILS, PLANNING_GUARDRAILS
 from harness.persistence import save_artifact, save_run_state, save_text_artifact
 from harness.state import RunState, Stage
 from harness.tools.code_runner import run_analysis_code
-from harness.tools.fred import fred_fetch, fred_search
+from harness.tools.fred import FredConfigurationError, FredToolError, fred_fetch, fred_search
 from workers.artifacts import (
     AnalysisArtifact,
+    ChartBriefArtifact,
     CheckerArtifact,
     CodeArtifact,
     DataArtifact,
     DataSelectionArtifact,
     DraftArtifact,
     PlannerArtifact,
+)
+from workers.chart_briefs import build_chart_brief
+from workers.analysis_templates import comparison_analysis_code
+from workers.openai_client import (
+    openai_timeout_details,
+    user_facing_openai_timeout_message,
 )
 
 
@@ -41,6 +75,24 @@ RETRY_STAGES = {
     "draft_answer": Stage.DRAFT_ANSWER,
 }
 
+# Whole-run wall clock. Per-call OpenAI hard timeouts are stage-specific
+# (see workers.openai_client.OPENAI_TIMEOUT_SECONDS_BY_STAGE): plan/select/draft
+# 30s, design_chart 60s, write_code 120s. Calls are also capped by remaining
+# run budget so a slow codegen retry cannot hang past this deadline.
+DEFAULT_RUN_DEADLINE_SECONDS = 180.0
+MAX_OPENAI_TIMEOUT_RETRIES_PER_STAGE = 1
+MIN_TIMEOUT_RETRY_SECONDS = 15.0
+MAX_COMPARISON_CHECKER_CODEGEN_RETRIES = 2
+MAX_CHECKER_DATA_DISCOVERY_RETRIES = 2
+
+
+class StageControl(Exception):
+    """Interrupt the current stage after alarm routing."""
+
+    def __init__(self, action: str) -> None:
+        self.action = action
+        super().__init__(action)
+
 
 class Orchestrator:
     """Owns stage progression, retries, escalation, and release decisions."""
@@ -52,22 +104,46 @@ class Orchestrator:
         worker: Any | None = None,
         checker: Any | None = None,
         fred_api_key: str | None = None,
+        progress_callback: Callable[[str, str], None] | None = None,
+        deadline_seconds: float | None = DEFAULT_RUN_DEADLINE_SECONDS,
     ) -> None:
         self.state = state
         self.runs_dir = Path(runs_dir)
         self.worker = worker
         self.checker = checker
         self.fred_api_key = fred_api_key or None
+        self.progress_callback = progress_callback
+        self.deadline_seconds = deadline_seconds
+        self._deadline_at = (
+            None if deadline_seconds is None else time.monotonic() + deadline_seconds
+        )
+        self._loop_iterations = 0
+        self._max_loop_iterations = max(8, (state.max_turns + 1) * 8)
+        self._timeout_retries: dict[str, int] = {}
+        self._write_code_attempts = 0
+        self._comparison_codegen_fallback_used = False
+        self._force_comparison_template = False
+        self._comparison_checker_codegen_retries = 0
+        self._checker_data_discovery_retries = 0
+        self._fetch_lookback_extra_years = 0
+        self._last_fetch_observation_start: str | None = None
         self._checks: list[dict[str, Any]] = []
+        self._guardrails: list[dict[str, Any]] = []
+        self._timeline: list[dict[str, Any]] = []
         self._persist()
+        self._notify(state.current_stage.value, "Run started.")
 
     def run(self) -> RunState:
-        if self.worker is not None:
-            return self._run_integrated()
+        try:
+            if self.worker is not None:
+                return self._run_integrated()
 
-        while self.state.current_stage not in TERMINAL_STAGES:
-            self.advance_stage()
-        return self.state
+            while self.state.current_stage not in TERMINAL_STAGES:
+                self.advance_stage()
+            return self.state
+        except KeyboardInterrupt:
+            self._mark_interrupted()
+            raise
 
     def advance_stage(self) -> RunState:
         if self.state.current_stage in TERMINAL_STAGES:
@@ -153,34 +229,159 @@ class Orchestrator:
         )
         self._persist_alarms()
 
+        context: dict[str, Any] = {}
         try:
-            plan = self._planning_stage()
+            self._run_input_guardrails()
+            self._require_fred_configured()
+            if self.state.current_stage is Stage.INPUT:
+                self._set_stage(Stage.PLANNING)
+        except StageControl:
+            return self.state
+
+        while self.state.current_stage not in TERMINAL_STAGES:
+            self._loop_iterations += 1
+            try:
+                self._raise_if_over_budget()
+                self._continue_from_current_stage(context)
+            except StageControl as control:
+                if control.action != "retry" or self.state.current_stage in TERMINAL_STAGES:
+                    return self.state
+            except Exception as exc:
+                if self.state.current_stage is not Stage.ESCALATED:
+                    try:
+                        self._handle_stage_exception(exc)
+                    except StageControl as control:
+                        if (
+                            control.action == "retry"
+                            and self.state.current_stage not in TERMINAL_STAGES
+                        ):
+                            continue
+                        return self.state
+                return self.state
+        return self.state
+
+    def _continue_from_current_stage(self, context: dict[str, Any]) -> None:
+        stage = self.state.current_stage
+        if stage is Stage.PLANNING:
+            context["plan"] = self._planning_stage()
+            self._set_stage(Stage.DATA_DISCOVERY)
+            return
+        if stage is Stage.DATA_DISCOVERY:
+            plan = context.get("plan") or self._planning_stage()
+            context["plan"] = plan
             search_payload, selection, data = self._data_discovery_stage(plan)
-            analysis = self._code_generation_stage(plan, data)
-            draft = self._draft_answer_stage(plan, analysis)
-            checker_artifact = self._checker_review_stage(
-                plan,
-                data,
-                analysis,
+            context["search_payload"] = search_payload
+            context["selection"] = selection
+            context["data"] = data
+            self._set_stage(Stage.CODE_GENERATION)
+            return
+        if stage is Stage.CODE_GENERATION:
+            plan = context.get("plan") or self._planning_stage()
+            data = context.get("data")
+            if data is None:
+                search_payload, selection, data = self._data_discovery_stage(plan)
+                context["search_payload"] = search_payload
+                context["selection"] = selection
+                context["data"] = data
+            context["plan"] = plan
+            context["analysis"] = self._code_generation_stage(plan, data)
+            self._set_stage(Stage.DRAFT_ANSWER)
+            return
+        if stage is Stage.DRAFT_ANSWER:
+            plan = context.get("plan") or self._planning_stage()
+            analysis = context.get("analysis")
+            if analysis is None:
+                data = context.get("data")
+                if data is None:
+                    _, _, data = self._data_discovery_stage(plan)
+                    context["data"] = data
+                analysis = self._code_generation_stage(plan, data)
+                context["analysis"] = analysis
+            context["plan"] = plan
+            context["draft"] = self._draft_answer_stage(plan, analysis)
+            self._set_stage(Stage.CHECKER_REVIEW)
+            return
+        if stage is Stage.CHECKER_REVIEW:
+            plan = context.get("plan") or self._planning_stage()
+            data = context.get("data")
+            analysis = context.get("analysis")
+            draft = context.get("draft")
+            if data is None or analysis is None or draft is None:
+                raise RuntimeError("Checker review is missing required artifacts.")
+            checker_artifact = self._checker_review_stage(plan, data, analysis, draft)
+            self._release_answer(
                 draft,
+                checker_artifact,
+                context.get("search_payload") or {},
+                context.get("selection") or DataSelectionArtifact([], [], ""),
             )
-            self._release_answer(draft, checker_artifact, search_payload, selection)
-            return self.release()
-        except Exception as exc:
-            if self.state.current_stage is not Stage.ESCALATED:
-                self._escalate_with_alarm(
-                    type="stage_failed",
-                    message=f"{self.state.current_stage.value} failed: {exc}",
-                    context={"error": repr(exc)},
-                    retry_from=self._retry_from_current_stage(),
-                )
-            raise
+            self._append_timeline(
+                "release",
+                "Release",
+                "complete",
+                "draft",
+                "Grounded answer released.",
+            )
+            self.release()
+            return
+
+        self.escalate()
+
+    def _run_input_guardrails(self) -> None:
+        self._set_stage(Stage.INPUT)
+        for guardrail in INPUT_GUARDRAILS:
+            result = guardrail.evaluate(self.state.question)
+            self._record_guardrail(guardrail.__class__.__name__, "input", result)
+            if not result.passed:
+                self._fail_from_result(result.alarm, default_action="escalate")
+        self._append_timeline(
+            "input_guardrails",
+            "Input Guardrails",
+            "complete",
+            "guardrails",
+            "Question passed economic-scope and safety checks.",
+        )
+
+    def _require_fred_configured(self) -> None:
+        from harness.config import resolve_fred_api_key
+
+        if resolve_fred_api_key(self.fred_api_key):
+            return
+        self._fail_with_alarm(
+            type="fred_not_configured",
+            message=(
+                "FRED_API_KEY is not configured. Set it in your environment, a "
+                ".env file, or Streamlit secrets."
+            ),
+            context={},
+            retry_from="data_discovery",
+            recommended_action="escalate",
+        )
 
     def _planning_stage(self) -> PlannerArtifact:
         self._set_stage(Stage.PLANNING)
+        self._append_timeline(
+            "planning",
+            "Planning",
+            "in_progress",
+            "planner",
+            "Requesting a plan from the worker.",
+        )
         plan = self.worker.plan(self.state.question, self.state)
         plan = PlannerArtifact.from_dict(plan.to_dict())
         self._save_json_artifact("plan", plan)
+        for guardrail in PLANNING_GUARDRAILS:
+            result = guardrail.evaluate(plan)
+            self._record_guardrail(guardrail.__class__.__name__, "planning", result)
+            if not result.passed:
+                self._fail_from_result(result.alarm, default_action="retry")
+        self._append_timeline(
+            "planning",
+            "Planning",
+            "complete",
+            "planner",
+            "Planner produced a structured FRED analysis plan.",
+        )
         return plan
 
     def _data_discovery_stage(
@@ -188,14 +389,37 @@ class Orchestrator:
         plan: PlannerArtifact,
     ) -> tuple[dict[str, Any], DataSelectionArtifact, DataArtifact]:
         self._set_stage(Stage.DATA_DISCOVERY)
+        self._append_timeline(
+            "data_discovery",
+            "Data Discovery",
+            "in_progress",
+            "data_selection",
+            "Searching FRED and selecting series.",
+        )
 
         queries = []
         flattened_results: list[dict[str, Any]] = []
-        for query in plan.search_queries:
-            results = fred_search(query, api_key=self.fred_api_key)
-            result_dicts = [result.to_dict() for result in results]
-            queries.append({"query": query, "results": result_dicts})
-            flattened_results.extend(result_dicts)
+        try:
+            for query in plan.search_queries:
+                results = fred_search(query, api_key=self.fred_api_key)
+                result_dicts = [result.to_dict() for result in results]
+                queries.append({"query": query, "results": result_dicts})
+                flattened_results.extend(result_dicts)
+        except FredConfigurationError as exc:
+            self._fail_with_alarm(
+                type="fred_not_configured",
+                message=str(exc),
+                context={"error": repr(exc)},
+                retry_from="data_discovery",
+                recommended_action="escalate",
+            )
+        except FredToolError as exc:
+            self._fail_with_alarm(
+                type="fred_search_failed",
+                message=str(exc),
+                context={"error": repr(exc)},
+                retry_from="data_discovery",
+            )
 
         search_payload = {"queries": queries}
         self._save_json_artifact("fred_search", search_payload)
@@ -210,23 +434,68 @@ class Orchestrator:
             if series.get("series_id")
         ]
         if not selected_ids:
-            self._raise_with_alarm(
+            self._fail_with_alarm(
                 type="data_selection_failed",
                 message="Worker did not select any FRED series.",
                 context={"selected_data": selection.to_dict()},
                 retry_from="data_discovery",
             )
 
-        data = fred_fetch(
-            selected_ids,
-            api_key=self.fred_api_key,
-            observation_start=_five_years_ago(),
+        observation_start = observation_start_for_fetch(
+            self.state.question,
+            plan,
+            extra_years=self._fetch_lookback_extra_years,
         )
+        try:
+            data = fred_fetch(
+                selected_ids,
+                api_key=self.fred_api_key,
+                observation_start=observation_start,
+            )
+        except FredConfigurationError as exc:
+            self._fail_with_alarm(
+                type="fred_not_configured",
+                message=str(exc),
+                context={"error": repr(exc)},
+                retry_from="data_discovery",
+                recommended_action="escalate",
+            )
+        except FredToolError as exc:
+            self._fail_with_alarm(
+                type="fred_fetch_failed",
+                message=str(exc),
+                context={"error": repr(exc), "selected_series": selected_ids},
+                retry_from="data_discovery",
+            )
+
+        self._last_fetch_observation_start = observation_start.isoformat()
+        data.metadata = dict(data.metadata or {})
         data.metadata["selected_series"] = selection.selected_series
+        data.metadata["observation_start"] = self._last_fetch_observation_start
+        data.metadata["requested_window_years"] = requested_window_years(
+            self.state.question,
+            plan,
+        )
+        data.metadata["requested_yoy_months"] = requested_yoy_months(
+            self.state.question,
+            plan,
+        )
+        data.metadata["raw_lookback_years"] = raw_history_years(
+            self.state.question,
+            plan,
+            extra_years=self._fetch_lookback_extra_years,
+        )
         self._save_json_artifact("data", data)
 
         self._run_data_checks(selection, data, flattened_results)
         self._require_stage_checks_passed(Stage.DATA_DISCOVERY)
+        self._append_timeline(
+            "data_discovery",
+            "Data Discovery",
+            "complete",
+            "data_selection",
+            "Harness searched FRED and fetched selected observations.",
+        )
         return search_payload, selection, data
 
     def _code_generation_stage(
@@ -235,38 +504,116 @@ class Orchestrator:
         data: DataArtifact,
     ) -> AnalysisArtifact:
         self._set_stage(Stage.CODE_GENERATION)
+        self._append_timeline(
+            "code_generation",
+            "Code Generation",
+            "in_progress",
+            "code",
+            "Writing and executing analysis code.",
+        )
 
-        code_artifact = self.worker.write_code(plan, data)
+        chart_brief = self._design_chart(plan, data)
+        data.metadata = dict(data.metadata or {})
+        data.metadata["chart_brief"] = chart_brief.to_dict()
+        self._save_json_artifact("data", data)
+
+        code_artifact = self._write_code(plan, data, chart_brief)
         code_artifact = CodeArtifact.from_dict(code_artifact.to_dict())
         self._save_text_artifact("generated_code", "generated_code.py", code_artifact.code)
 
-        code_output_path = self._run_dir() / "code_output.json"
-        self.state.artifacts["code_output"] = "code_output.json"
-        self._persist()
+        simplicity = CodeSimplicityCheckpoint().evaluate(code_artifact)
+        self._apply_checkpoint(
+            simplicity,
+            name="CodeSimplicityCheckpoint",
+            stage=Stage.CODE_GENERATION,
+        )
+        analysis: AnalysisArtifact | None = None
+        if not simplicity.passed:
+            analysis = self._recover_comparison_analysis(plan, data, chart_brief)
+            if analysis is None:
+                self._mark_codegen_retry(data, ["CodeSimplicityCheckpoint"])
+                alarm = simplicity.alarm
+                self._fail_with_alarm(
+                    type="code_simplicity_failed",
+                    message=(
+                        alarm.message
+                        if alarm is not None
+                        else "Generated analysis code is too large."
+                    ),
+                    context=dict(alarm.context) if alarm is not None else {},
+                    retry_from="code_generation",
+                )
+            self._reset_code_generation_checks()
 
-        try:
-            analysis = run_analysis_code(
-                code_artifact,
-                data,
-                output_log_path=code_output_path,
-            )
-        except Exception as exc:
-            self._raise_with_alarm(
-                type="code_execution_failed",
-                message="Generated analysis code failed.",
-                context={
-                    "generated_code_path": str(self._run_dir() / "generated_code.py"),
-                    "code_output_path": str(code_output_path),
-                    "error": repr(exc),
-                },
-                retry_from="code_generation",
-            )
+        if analysis is None:
+            code_output_path = self._run_dir() / "code_output.json"
+            self.state.artifacts["code_output"] = "code_output.json"
+            self._persist()
+            try:
+                analysis = run_analysis_code(
+                    code_artifact,
+                    data,
+                    output_log_path=code_output_path,
+                )
+            except Exception as exc:
+                self._apply_checkpoint(
+                    CodeExecutionCheckpoint().evaluate({
+                        "succeeded": False,
+                        "execution_error": repr(exc),
+                    }),
+                    name="CodeExecutionCheckpoint",
+                    stage=Stage.CODE_GENERATION,
+                )
+                analysis = self._recover_comparison_analysis(plan, data, chart_brief)
+                if analysis is None:
+                    self._mark_codegen_retry(data, ["CodeExecutionCheckpoint"])
+                    self._fail_with_alarm(
+                        type="code_execution_failed",
+                        message="Generated analysis code failed.",
+                        context={
+                            "generated_code_path": str(self._run_dir() / "generated_code.py"),
+                            "code_output_path": str(code_output_path),
+                            "error": repr(exc),
+                        },
+                        retry_from="code_generation",
+                    )
+                self._reset_code_generation_checks()
 
         analysis = AnalysisArtifact.from_dict(analysis.to_dict())
+        from harness.charts import normalize_analysis_charts
+
+        honesty = ChartHonestyCheckpoint().evaluate(analysis)
+        analysis = normalize_analysis_charts(analysis, chart_brief)
         self._save_json_artifact("analysis", analysis)
 
-        self._run_code_checks(analysis)
+        self._run_code_checks(analysis, chart_brief=chart_brief, honesty=honesty, data=data)
+        failures = self._code_generation_failures()
+        if failures:
+            recovered = self._recover_comparison_analysis(plan, data, chart_brief)
+            if recovered is not None:
+                honesty = ChartHonestyCheckpoint().evaluate(recovered)
+                analysis = normalize_analysis_charts(recovered, chart_brief)
+                self._save_json_artifact("analysis", analysis)
+                self._reset_code_generation_checks()
+                self._run_code_checks(
+                    analysis,
+                    chart_brief=chart_brief,
+                    honesty=honesty,
+                    data=data,
+                )
+            else:
+                self._mark_codegen_retry(
+                    data,
+                    [str(item.get("name") or "") for item in failures],
+                )
         self._require_stage_checks_passed(Stage.CODE_GENERATION)
+        self._append_timeline(
+            "code_generation",
+            "Code Generation",
+            "complete",
+            "code",
+            "Harness executed worker-generated analysis code.",
+        )
         return analysis
 
     def _draft_answer_stage(
@@ -275,12 +622,26 @@ class Orchestrator:
         analysis: AnalysisArtifact,
     ) -> DraftArtifact:
         self._set_stage(Stage.DRAFT_ANSWER)
+        self._append_timeline(
+            "draft_answer",
+            "Draft Answer",
+            "in_progress",
+            "analysis",
+            "Drafting the user-facing answer.",
+        )
         draft = self.worker.draft_answer(plan, analysis)
         draft = DraftArtifact.from_dict(draft.to_dict())
         self._save_json_artifact("draft", draft)
 
         self._run_answer_checks(plan, analysis, draft)
         self._require_stage_checks_passed(Stage.DRAFT_ANSWER)
+        self._append_timeline(
+            "draft_answer",
+            "Draft Answer",
+            "complete",
+            "analysis",
+            "Worker drafted a grounded user-facing answer.",
+        )
         return draft
 
     def _checker_review_stage(
@@ -296,13 +657,79 @@ class Orchestrator:
         self._save_json_artifact("checker", checker_artifact)
 
         if not checker_artifact.passed:
-            self._raise_with_alarm(
+            retry_from = checker_artifact.retry_from or "draft_answer"
+            if retry_from == "data_discovery":
+                self._cap_or_widen_data_discovery_retry(plan, checker_artifact)
+            if (
+                retry_from == "code_generation"
+                and _comparison_codegen_fallback_eligible(self.state.question, plan, data)
+            ):
+                self._comparison_checker_codegen_retries += 1
+                if (
+                    self._comparison_checker_codegen_retries
+                    >= MAX_COMPARISON_CHECKER_CODEGEN_RETRIES
+                ):
+                    self._fail_with_alarm(
+                        type="checker_failed",
+                        message=(
+                            "Checker did not approve the CPI vs PCE analysis after "
+                            f"{MAX_COMPARISON_CHECKER_CODEGEN_RETRIES} code_generation "
+                            "retries. Stopped instead of rewriting OpenAI codegen."
+                        ),
+                        context=checker_artifact.to_dict(),
+                        retry_from="code_generation",
+                        recommended_action="escalate",
+                    )
+                self._force_comparison_template = True
+            self._fail_with_alarm(
                 type="checker_failed",
                 message="Checker did not approve the draft answer.",
                 context=checker_artifact.to_dict(),
-                retry_from=checker_artifact.retry_from or "draft_answer",
+                retry_from=retry_from,
             )
         return checker_artifact
+
+    def _cap_or_widen_data_discovery_retry(
+        self,
+        plan: PlannerArtifact,
+        checker_artifact: CheckerArtifact,
+    ) -> None:
+        """Stop identical FRED refetches; widen YoY lookback at most once more."""
+
+        self._checker_data_discovery_retries += 1
+        proposed_extra = self._fetch_lookback_extra_years
+        if needs_yoy_raw_history(self.state.question, plan):
+            proposed_extra = self._fetch_lookback_extra_years + 1
+        proposed_start = observation_start_for_fetch(
+            self.state.question,
+            plan,
+            extra_years=proposed_extra,
+        ).isoformat()
+        unchanged = (
+            self._last_fetch_observation_start is not None
+            and proposed_start == self._last_fetch_observation_start
+        )
+        if (
+            self._checker_data_discovery_retries >= MAX_CHECKER_DATA_DISCOVERY_RETRIES
+            or unchanged
+        ):
+            self._fail_with_alarm(
+                type="checker_failed",
+                message=(
+                    "Checker requested data_discovery again without a wider fetch "
+                    "window. Stopped instead of repeating the same FRED lookback."
+                ),
+                context={
+                    **checker_artifact.to_dict(),
+                    "last_observation_start": self._last_fetch_observation_start,
+                    "proposed_observation_start": proposed_start,
+                    "unchanged_fetch_window": unchanged,
+                    "data_discovery_retries": self._checker_data_discovery_retries,
+                },
+                retry_from="data_discovery",
+                recommended_action="escalate",
+            )
+        self._fetch_lookback_extra_years = proposed_extra
 
     def _release_answer(
         self,
@@ -335,98 +762,203 @@ class Orchestrator:
         search_results: list[dict[str, Any]],
     ) -> None:
         selected_ids = [series["series_id"] for series in selection.selected_series]
-        searched_ids = {result.get("series_id") for result in search_results}
-        self._record_check(
-            "SourceProvenanceCheckpoint",
-            Stage.DATA_DISCOVERY,
-            all(series_id in searched_ids for series_id in selected_ids),
-            "Selected series must come from live FRED search results.",
-            {"selected_series": selected_ids},
+        self._apply_checkpoint(
+            SourceProvenanceCheckpoint().evaluate(selection, search_results),
+            name="SourceProvenanceCheckpoint",
+            stage=Stage.DATA_DISCOVERY,
+        )
+        self._apply_checkpoint(
+            DataCompletenessCheckpoint().evaluate(
+                data,
+                selected_series=selection.selected_series,
+            ),
+            name="DataCompletenessCheckpoint",
+            stage=Stage.DATA_DISCOVERY,
+        )
+        self._apply_checkpoint(
+            FreshnessCheckpoint().evaluate(data, selected_ids=selected_ids),
+            name="FreshnessCheckpoint",
+            stage=Stage.DATA_DISCOVERY,
+        )
+        self._apply_checkpoint(
+            InformationSufficiencyCheckpoint().evaluate(
+                data,
+                selected_ids=selected_ids,
+                question=self.state.question,
+            ),
+            name="InformationSufficiencyCheckpoint",
+            stage=Stage.DATA_DISCOVERY,
         )
 
-        counts = {
-            series_id: len(data.observations.get(series_id, []))
-            for series_id in selected_ids
-        }
-        self._record_check(
-            "DataCompletenessCheckpoint",
-            Stage.DATA_DISCOVERY,
-            bool(counts) and all(count >= 48 for count in counts.values()),
-            "Selected series must include at least 48 numeric observations.",
-            {"observation_counts": counts},
+    def _run_code_checks(
+        self,
+        analysis: AnalysisArtifact,
+        *,
+        chart_brief: ChartBriefArtifact | None = None,
+        honesty: Any | None = None,
+        data: DataArtifact | None = None,
+    ) -> None:
+        self._apply_checkpoint(
+            CodeExecutionCheckpoint().evaluate(analysis),
+            name="CodeExecutionCheckpoint",
+            stage=Stage.CODE_GENERATION,
+        )
+        self._apply_checkpoint(
+            OutputShapeCheckpoint().evaluate(analysis),
+            name="OutputShapeCheckpoint",
+            stage=Stage.CODE_GENERATION,
+        )
+        self._apply_checkpoint(
+            SourceProvenanceCheckpoint().evaluate(analysis),
+            name="MetricSourceProvenanceCheckpoint",
+            stage=Stage.CODE_GENERATION,
+        )
+        self._apply_checkpoint(
+            MathSanityCheckpoint().evaluate(analysis),
+            name="MathSanityCheckpoint",
+            stage=Stage.CODE_GENERATION,
+        )
+        self._apply_checkpoint(
+            ChartPromiseCheckpoint().evaluate(analysis),
+            name="ChartPromiseCheckpoint",
+            stage=Stage.CODE_GENERATION,
+        )
+        self._apply_checkpoint(
+            honesty if honesty is not None else ChartHonestyCheckpoint().evaluate(analysis),
+            name="ChartHonestyCheckpoint",
+            stage=Stage.CODE_GENERATION,
+        )
+        self._apply_checkpoint(
+            ChartLabelCheckpoint().evaluate(analysis),
+            name="ChartLabelCheckpoint",
+            stage=Stage.CODE_GENERATION,
+        )
+        self._apply_checkpoint(
+            ChartBriefCheckpoint().evaluate(
+                chart_brief,
+                data,
+                question=self.state.question,
+            ),
+            name="ChartBriefCheckpoint",
+            stage=Stage.CODE_GENERATION,
         )
 
-        latest_dates = {
-            series_id: _latest_observation_date(data.observations.get(series_id, []))
-            for series_id in selected_ids
-        }
-        freshness_passed = bool(latest_dates) and all(
-            latest is not None and (date.today() - latest).days <= 150
-            for latest in latest_dates.values()
-        )
-        self._record_check(
-            "FreshnessCheckpoint",
-            Stage.DATA_DISCOVERY,
-            freshness_passed,
-            "Latest CPI observations should reflect normal monthly release lag.",
-            {
-                "latest_dates": {
-                    series_id: latest.isoformat() if latest is not None else None
-                    for series_id, latest in latest_dates.items()
-                }
-            },
-        )
+    def _design_chart(self, plan: PlannerArtifact, data: DataArtifact) -> ChartBriefArtifact:
+        worker = self.worker
+        brief: ChartBriefArtifact | None = None
+        if hasattr(worker, "design_chart"):
+            try:
+                designed = worker.design_chart(plan, data)
+                brief = ChartBriefArtifact.from_dict(designed.to_dict())
+            except Exception:
+                brief = None
+        if brief is None:
+            brief = build_chart_brief(plan, data, question=self.state.question)
+        self._save_json_artifact("chart_brief", brief)
+        return brief
 
-        self._record_check(
-            "InformationSufficiencyCheckpoint",
-            Stage.DATA_DISCOVERY,
-            "CPIAUCSL" in selected_ids and bool(data.observations.get("CPIAUCSL")),
-            "CPIAUCSL observations are required for the canonical CPI question.",
-            {"selected_series": selected_ids},
-        )
-
-    def _run_code_checks(self, analysis: AnalysisArtifact) -> None:
-        self._record_check(
-            "CodeExecutionCheckpoint",
-            Stage.CODE_GENERATION,
-            isinstance(analysis, AnalysisArtifact),
-            "Generated code must execute and return an AnalysisArtifact.",
-        )
-        self._record_check(
-            "OutputShapeCheckpoint",
-            Stage.CODE_GENERATION,
-            all(
-                isinstance(value, list)
-                for value in [
-                    analysis.tables,
-                    analysis.metrics,
-                    analysis.claims,
-                    analysis.charts,
-                    analysis.warnings,
-                ]
+    def _write_code(
+        self,
+        plan: PlannerArtifact,
+        data: DataArtifact,
+        chart_brief: ChartBriefArtifact,
+    ) -> CodeArtifact:
+        if self._should_force_comparison_template(plan, data):
+            self._write_code_attempts += 1
+            self._comparison_codegen_fallback_used = True
+            self._force_comparison_template = False
+            data.metadata = dict(data.metadata or {})
+            data.metadata["chart_brief"] = chart_brief.to_dict()
+            self._notify(
+                Stage.CODE_GENERATION.value,
+                "Using the compact calendar YoY CPI vs PCE template instead of another OpenAI rewrite.",
             )
-            and isinstance(analysis.method_notes, str),
-            "Analysis output must match the required outer schema.",
+            return CodeArtifact(code=comparison_analysis_code())
+        method = self.worker.write_code
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "chart_brief" in parameters or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+        ):
+            self._write_code_attempts += 1
+            return method(plan, data, chart_brief=chart_brief)
+        self._write_code_attempts += 1
+        return method(plan, data)
+
+    def _should_force_comparison_template(
+        self,
+        plan: PlannerArtifact,
+        data: DataArtifact,
+    ) -> bool:
+        if not _comparison_codegen_fallback_eligible(self.state.question, plan, data):
+            return False
+        if self._force_comparison_template:
+            return True
+        if self._comparison_checker_codegen_retries >= 1:
+            return True
+        return self._write_code_attempts >= 1
+
+    def _recover_comparison_analysis(
+        self,
+        plan: PlannerArtifact,
+        data: DataArtifact,
+        chart_brief: ChartBriefArtifact,
+    ) -> AnalysisArtifact | None:
+        """Replace a failed OpenAI novel with the compact CPI vs PCE template once."""
+
+        if self._comparison_codegen_fallback_used:
+            return None
+        if not _comparison_codegen_fallback_eligible(self.state.question, plan, data):
+            return None
+        self._comparison_codegen_fallback_used = True
+        self._notify(
+            Stage.CODE_GENERATION.value,
+            "Using the compact CPI vs PCE template after generated analysis failed schema checks.",
         )
-        metric_values = [
-            metric.get("value")
-            for metric in analysis.metrics
-            if isinstance(metric, dict) and isinstance(metric.get("value"), (int, float))
+        data.metadata = dict(data.metadata or {})
+        data.metadata["chart_brief"] = chart_brief.to_dict()
+        code_artifact = CodeArtifact(code=comparison_analysis_code())
+        self._save_text_artifact("generated_code", "generated_code.py", code_artifact.code)
+        code_output_path = self._run_dir() / "code_output.json"
+        self.state.artifacts["code_output"] = "code_output.json"
+        try:
+            analysis = run_analysis_code(
+                code_artifact,
+                data,
+                output_log_path=code_output_path,
+            )
+        except Exception:
+            return None
+        return AnalysisArtifact.from_dict(analysis.to_dict())
+
+    def _mark_codegen_retry(self, data: DataArtifact, failed_checks: list[str]) -> None:
+        data.metadata = dict(data.metadata or {})
+        data.metadata["codegen_retry"] = {
+            "failed_checks": [name for name in failed_checks if name],
+            "instruction": (
+                "Previous analysis_output failed MathSanity and/or ChartPromise. "
+                "Emit minimal numeric metrics and one chart matching the harness schema."
+            ),
+        }
+        self._save_json_artifact("data", data)
+
+    def _reset_code_generation_checks(self) -> None:
+        self._checks = [
+            check
+            for check in self._checks
+            if check.get("stage") != Stage.CODE_GENERATION.value
         ]
-        self._record_check(
-            "MathSanityCheckpoint",
-            Stage.CODE_GENERATION,
-            bool(metric_values)
-            and all(math.isfinite(value) and abs(value) < 1000 for value in metric_values),
-            "Metric values must be finite and plausibly scaled.",
-            {"metric_values": metric_values},
-        )
-        self._record_check(
-            "ChartPromiseCheckpoint",
-            Stage.CODE_GENERATION,
-            bool(analysis.charts),
-            "Analysis must include chart descriptor data.",
-        )
+        if self._checks:
+            self._save_json_artifact("checkpoint_results", {"checks": self._checks})
+
+    def _code_generation_failures(self) -> list[dict[str, Any]]:
+        return [
+            check
+            for check in self._checks
+            if check.get("stage") == Stage.CODE_GENERATION.value and not check.get("passed")
+        ]
 
     def _run_answer_checks(
         self,
@@ -434,29 +966,37 @@ class Orchestrator:
         analysis: AnalysisArtifact,
         draft: DraftArtifact,
     ) -> None:
-        metric_names = {
-            metric.get("name")
-            for metric in analysis.metrics
-            if isinstance(metric, dict) and isinstance(metric.get("name"), str)
-        }
-        referenced = set(draft.referenced_metrics)
-        self._record_check(
-            "AnswerGroundingCheckpoint",
-            Stage.DRAFT_ANSWER,
-            bool(referenced) and referenced.issubset(metric_names),
-            "Draft answer must reference generated metric names.",
-            {
-                "referenced_metrics": sorted(referenced),
-                "available_metrics": sorted(metric_names),
-            },
+        self._apply_checkpoint(
+            AnswerGroundingCheckpoint().evaluate(draft, analysis),
+            name="AnswerGroundingCheckpoint",
+            stage=Stage.DRAFT_ANSWER,
         )
-        self._record_check(
-            "SuccessCriteriaCheckpoint",
-            Stage.DRAFT_ANSWER,
-            "CPI" in draft.answer and all(criteria for criteria in plan.success_criteria),
-            "Draft answer must satisfy the plan success criteria.",
-            {"success_criteria": plan.success_criteria},
+        self._apply_checkpoint(
+            SuccessCriteriaCheckpoint().evaluate(
+                draft,
+                analysis,
+                plan=plan,
+                question=self.state.question,
+            ),
+            name="SuccessCriteriaCheckpoint",
+            stage=Stage.DRAFT_ANSWER,
         )
+
+    def _apply_checkpoint(
+        self,
+        result: Any,
+        *,
+        name: str,
+        stage: Stage,
+    ) -> None:
+        passed = bool(getattr(result, "passed", False))
+        message = getattr(result, "reason", "") or (
+            result.alarm.message if getattr(result, "alarm", None) is not None else ""
+        )
+        context = {}
+        if getattr(result, "alarm", None) is not None:
+            context = dict(result.alarm.context or {})
+        self._record_check(name, stage, passed, message, context)
 
     def _record_check(
         self,
@@ -468,14 +1008,48 @@ class Orchestrator:
     ) -> None:
         self._checks.append(
             {
+                "kind": "checkpoint",
                 "name": name,
                 "stage": stage.value,
                 "passed": bool(passed),
+                "status": "passed" if passed else "failed",
                 "message": message,
                 "context": context or {},
             }
         )
         self._save_json_artifact("checkpoint_results", {"checks": self._checks})
+
+    def _record_guardrail(self, name: str, stage: str, result: Any) -> None:
+        self._guardrails.append(
+            {
+                "kind": "guardrail",
+                "name": name,
+                "stage": stage,
+                "status": "passed" if result.passed else "failed",
+                "message": result.reason,
+            }
+        )
+        self._save_json_artifact("guardrails", self._guardrails)
+
+    def _append_timeline(
+        self,
+        stage_id: str,
+        label: str,
+        status: str,
+        artifact_key: str,
+        summary: str,
+    ) -> None:
+        self._timeline = [item for item in self._timeline if item.get("stage_id") != stage_id]
+        self._timeline.append(
+            {
+                "stage_id": stage_id,
+                "label": label,
+                "status": status,
+                "artifact_key": artifact_key,
+                "summary": summary,
+            }
+        )
+        self._save_json_artifact("timeline", self._timeline)
 
     def _require_stage_checks_passed(self, stage: Stage) -> None:
         failed = [
@@ -484,7 +1058,7 @@ class Orchestrator:
             if check["stage"] == stage.value and not check["passed"]
         ]
         if failed:
-            self._raise_with_alarm(
+            self._fail_with_alarm(
                 type="checkpoint_failed",
                 message=f"{stage.value} checkpoint failed.",
                 context={"checks": failed},
@@ -493,7 +1067,74 @@ class Orchestrator:
 
     def _set_stage(self, stage: Stage) -> None:
         self.state.current_stage = stage
+        self._checks = [check for check in self._checks if check["stage"] != stage.value]
+        if self._checks:
+            self._save_json_artifact("checkpoint_results", {"checks": self._checks})
         self._persist()
+        self._notify(stage.value, f"Entered {stage.value}.")
+        self._raise_if_over_budget()
+
+    def _notify(self, stage: str, message: str) -> None:
+        if self.progress_callback is None:
+            return
+        try:
+            self.progress_callback(stage, message)
+        except Exception:
+            return
+
+    def _mark_interrupted(self) -> None:
+        if self.state.current_stage in TERMINAL_STAGES:
+            return
+        self.escalate(
+            Alarm(
+                type="run_interrupted",
+                severity="error",
+                stage=self.state.current_stage.value,
+                message=(
+                    "Run was interrupted (Ctrl+C). Persisted the current stage "
+                    "instead of waiting on a blocking OpenAI call."
+                ),
+                context={"retry_count": self.state.retry_count},
+                recommended_action="escalate",
+                retry_from=self._retry_from_current_stage(),
+            )
+        )
+        self._persist_alarms()
+
+    def _raise_if_over_budget(self) -> None:
+        self._apply_openai_timeout_cap()
+        if self._loop_iterations > self._max_loop_iterations:
+            self._fail_with_alarm(
+                type="run_iteration_limit",
+                message=(
+                    f"Run exceeded the stage-loop cap ({self._max_loop_iterations} "
+                    "iterations) and was stopped instead of spinning forever."
+                ),
+                context={
+                    "loop_iterations": self._loop_iterations,
+                    "max_loop_iterations": self._max_loop_iterations,
+                    "retry_count": self.state.retry_count,
+                    "max_turns": self.state.max_turns,
+                },
+                retry_from=self._retry_from_current_stage(),
+                recommended_action="escalate",
+            )
+        if self._deadline_at is not None and time.monotonic() >= self._deadline_at:
+            limit = self.deadline_seconds if self.deadline_seconds is not None else 0
+            self._fail_with_alarm(
+                type="run_deadline_exceeded",
+                message=(
+                    f"Run exceeded the {limit:.0f}s wall-clock limit and was "
+                    "stopped instead of hanging."
+                ),
+                context={
+                    "deadline_seconds": self.deadline_seconds,
+                    "current_stage": self.state.current_stage.value,
+                    "retry_count": self.state.retry_count,
+                },
+                retry_from=self._retry_from_current_stage(),
+                recommended_action="escalate",
+            )
 
     def _save_json_artifact(self, name: str, artifact: Any) -> Path:
         path = save_artifact(self.state.run_id, name, artifact, self.runs_dir)
@@ -513,29 +1154,31 @@ class Orchestrator:
             [alarm.to_dict() for alarm in self.state.alarms],
         )
 
-    def _raise_with_alarm(
-        self,
-        *,
-        type: str,
-        message: str,
-        context: dict[str, Any],
-        retry_from: str,
-    ) -> None:
-        self._escalate_with_alarm(
-            type=type,
-            message=message,
-            context=context,
-            retry_from=retry_from,
-        )
-        raise RuntimeError(message)
+    def _fail_from_result(self, alarm: Alarm | None, *, default_action: str) -> None:
+        if alarm is None:
+            alarm = Alarm(
+                type="guardrail_failed",
+                severity="error",
+                stage=self.state.current_stage.value,
+                message="Guardrail failed.",
+                context={},
+                recommended_action=default_action,
+                retry_from=self._retry_from_current_stage(),
+            )
+        self.route_alarm(alarm)
+        self._persist_alarms()
+        if self.state.current_stage in TERMINAL_STAGES:
+            raise StageControl("halt")
+        raise StageControl("retry")
 
-    def _escalate_with_alarm(
+    def _fail_with_alarm(
         self,
         *,
         type: str,
         message: str,
         context: dict[str, Any],
         retry_from: str,
+        recommended_action: str = "retry",
     ) -> None:
         alarm = Alarm(
             type=type,
@@ -543,11 +1186,14 @@ class Orchestrator:
             stage=self.state.current_stage.value,
             message=message,
             context=context,
-            recommended_action="retry",
+            recommended_action=recommended_action,
             retry_from=retry_from,
         )
-        self.escalate(alarm)
+        self.route_alarm(alarm)
         self._persist_alarms()
+        if self.state.current_stage in TERMINAL_STAGES:
+            raise StageControl("halt")
+        raise StageControl("retry")
 
     def _retry_from_current_stage(self) -> str:
         if self.state.current_stage in {
@@ -559,22 +1205,89 @@ class Orchestrator:
             return self.state.current_stage.value
         return "draft_answer"
 
+    def _remaining_deadline_seconds(self) -> float | None:
+        if self._deadline_at is None:
+            return None
+        return max(0.0, self._deadline_at - time.monotonic())
+
+    def _apply_openai_timeout_cap(self) -> None:
+        remaining = self._remaining_deadline_seconds()
+        for actor in (self.worker, self.checker):
+            setter = getattr(actor, "set_call_timeout_cap", None)
+            if callable(setter):
+                setter(remaining)
+
+    def _should_retry_openai_timeout(self, stage: str) -> bool:
+        if self._timeout_retries.get(stage, 0) >= MAX_OPENAI_TIMEOUT_RETRIES_PER_STAGE:
+            return False
+        if self.state.retry_count >= self.state.max_turns:
+            return False
+        remaining = self._remaining_deadline_seconds()
+        if remaining is not None and remaining < MIN_TIMEOUT_RETRY_SECONDS:
+            return False
+        return True
+
+    def _handle_stage_exception(self, exc: Exception) -> None:
+        details = openai_timeout_details(exc)
+        if details is None:
+            self._fail_with_alarm(
+                type="stage_failed",
+                message=f"{self.state.current_stage.value} failed: {exc}",
+                context={"error": repr(exc)},
+                retry_from=self._retry_from_current_stage(),
+                recommended_action="escalate",
+            )
+            return
+
+        stage = self.state.current_stage.value
+        stage_key = details["stage_label"] or details["schema_name"] or stage
+        timeout_seconds = float(details["timeout_seconds"])
+        can_retry = self._should_retry_openai_timeout(stage)
+        message = user_facing_openai_timeout_message(stage_key, timeout_seconds)
+        if can_retry:
+            message += " Retrying this stage once."
+            self._timeout_retries[stage] = self._timeout_retries.get(stage, 0) + 1
+            self._notify(stage, message)
+            recommended_action = "retry"
+        else:
+            message += " The run was stopped instead of waiting forever."
+            recommended_action = "escalate"
+
+        self._fail_with_alarm(
+            type="stage_timeout",
+            message=message,
+            context={
+                "error": repr(exc),
+                "timeout_seconds": timeout_seconds,
+                "stage_label": details["stage_label"],
+                "schema_name": details["schema_name"],
+                "timeout_retry": can_retry,
+            },
+            retry_from=self._retry_from_current_stage(),
+            recommended_action=recommended_action,
+        )
+
     def _run_dir(self) -> Path:
         return self.runs_dir / self.state.run_id
 
 
-def _five_years_ago() -> date:
-    today = date.today()
-    try:
-        return today.replace(year=today.year - 5)
-    except ValueError:
-        return today.replace(month=2, day=28, year=today.year - 5)
-
-
-def _latest_observation_date(rows: list[dict[str, Any]]) -> date | None:
-    if not rows:
-        return None
-    try:
-        return datetime.strptime(str(rows[-1]["date"]), "%Y-%m-%d").date()
-    except (KeyError, TypeError, ValueError):
-        return None
+def _comparison_codegen_fallback_eligible(
+    question: str,
+    plan: PlannerArtifact,
+    data: DataArtifact,
+) -> bool:
+    series_ids = [str(item) for item in (data.series_ids or [])]
+    if len(series_ids) < 2:
+        return False
+    if is_comparison_question(question):
+        return True
+    if set(CPI_PCE_SERIES) <= set(series_ids):
+        return True
+    blob = " ".join(
+        [
+            str(getattr(plan, "measurement_strategy", "") or ""),
+            " ".join(str(item) for item in getattr(plan, "economic_concepts", []) or []),
+            " ".join(str(item) for item in getattr(plan, "search_queries", []) or []),
+        ]
+    ).lower()
+    return "pce" in blob or "pcepi" in blob

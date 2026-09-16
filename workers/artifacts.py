@@ -135,6 +135,112 @@ class CodeArtifact:
         return cls(code=_required(data, "code"))
 
 
+ALLOWED_CHART_LAYOUTS = {"single", "dual_axis", "stacked"}
+ALLOWED_CHART_TYPES = {"line", "scatter", "bars", "panels"}
+
+
+@dataclass
+class ChartBriefArtifact:
+    claim: str
+    series_ids: list[str]
+    transforms: list[str]
+    layout: str
+    y_starts_at_zero: bool
+    time_window_rationale: str
+    annotations: list[str]
+    title: str
+    x_label: str
+    y_label: str
+    units: str
+    notes: str
+    chart_type: str
+    y_left_label: str = ""
+    y_right_label: str = ""
+    design_notes: str = ""
+
+    def __post_init__(self) -> None:
+        _require_non_empty_string("claim", self.claim)
+        _require_string_list("series_ids", self.series_ids)
+        for index, series_id in enumerate(self.series_ids):
+            if series_id.strip() == "":
+                raise ArtifactValidationError(f"series_ids[{index}] must be non-empty")
+        _require_non_empty_string_list("transforms", self.transforms)
+        _require_non_empty_string("layout", self.layout)
+        self.layout = self.layout.strip().lower().replace("-", "_").replace(" ", "_")
+        layout_aliases = {
+            "small_multiples": "stacked",
+            "small_multiple": "stacked",
+            "panels": "stacked",
+            "dual": "dual_axis",
+            "growth_overlay": "single",
+        }
+        self.layout = layout_aliases.get(self.layout, self.layout)
+        if self.layout not in ALLOWED_CHART_LAYOUTS:
+            allowed = ", ".join(sorted(ALLOWED_CHART_LAYOUTS))
+            raise ArtifactValidationError(f"layout must be one of: {allowed}")
+        if not isinstance(self.y_starts_at_zero, bool):
+            raise ArtifactValidationError("y_starts_at_zero must be a bool")
+        _require_non_empty_string("time_window_rationale", self.time_window_rationale)
+        _require_string_list("annotations", self.annotations)
+        _require_non_empty_string("title", self.title)
+        _require_non_empty_string("x_label", self.x_label)
+        _require_non_empty_string("y_label", self.y_label)
+        _require_non_empty_string("units", self.units)
+        _require_non_empty_string("notes", self.notes)
+        _require_non_empty_string("chart_type", self.chart_type)
+        self.chart_type = self.chart_type.strip().lower()
+        chart_type_aliases = {"bar": "bars", "scatterplot": "scatter", "panel": "panels"}
+        self.chart_type = chart_type_aliases.get(self.chart_type, self.chart_type)
+        if self.chart_type not in ALLOWED_CHART_TYPES:
+            allowed = ", ".join(sorted(ALLOWED_CHART_TYPES))
+            raise ArtifactValidationError(f"chart_type must be one of: {allowed}")
+        _require_string("y_left_label", self.y_left_label)
+        _require_string("y_right_label", self.y_right_label)
+        _require_string("design_notes", self.design_notes)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "claim": self.claim,
+            "series_ids": list(self.series_ids),
+            "transforms": list(self.transforms),
+            "layout": self.layout,
+            "y_starts_at_zero": self.y_starts_at_zero,
+            "time_window_rationale": self.time_window_rationale,
+            "annotations": list(self.annotations),
+            "title": self.title,
+            "x_label": self.x_label,
+            "y_label": self.y_label,
+            "units": self.units,
+            "notes": self.notes,
+            "chart_type": self.chart_type,
+            "y_left_label": self.y_left_label,
+            "y_right_label": self.y_right_label,
+            "design_notes": self.design_notes,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ChartBriefArtifact":
+        _require_mapping(data)
+        return cls(
+            claim=_required(data, "claim"),
+            series_ids=_required(data, "series_ids"),
+            transforms=_required(data, "transforms"),
+            layout=_required(data, "layout"),
+            y_starts_at_zero=_required(data, "y_starts_at_zero"),
+            time_window_rationale=_required(data, "time_window_rationale"),
+            annotations=_required(data, "annotations"),
+            title=_required(data, "title"),
+            x_label=data.get("x_label") or "date",
+            y_label=_required(data, "y_label"),
+            units=_required(data, "units"),
+            notes=_required(data, "notes"),
+            chart_type=_required(data, "chart_type"),
+            y_left_label=data.get("y_left_label") or "",
+            y_right_label=data.get("y_right_label") or "",
+            design_notes=data.get("design_notes") or "",
+        )
+
+
 @dataclass
 class AnalysisArtifact:
     tables: list
