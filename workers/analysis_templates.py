@@ -468,6 +468,20 @@ left_field = left_id + "_yoy"
 right_field = right_id + "_yoy"
 raw_common = sorted(set(left_levels) & set(right_levels))
 latest_raw_month = raw_common[-1] if raw_common else latest["date"][:7]
+yoy_start = yoy_rows[0]["date"][:7]
+yoy_end = latest["date"][:7]
+overlap_n = len(yoy_rows)
+window_note = (
+    str(overlap_n)
+    + " overlapping YoY months from "
+    + yoy_start
+    + " to "
+    + yoy_end
+)
+if overlap_n < 60:
+    window_note += (
+        "; shorter than five years of YoY, so the average gap is not a five-year average"
+    )
 if str(brief_notes).lower().startswith("do not "):
     brief_notes = ""
 notes = brief_notes or (
@@ -476,8 +490,8 @@ notes = brief_notes or (
     + " (" + left_id + ") and "
     + series_name(right_id)
     + " (" + right_id + "); "
-    + str(len(yoy_rows))
-    + " overlapping months. Latest common raw month "
+    + window_note
+    + ". Latest common raw month "
     + latest_raw_month
     + "."
 )
@@ -497,8 +511,10 @@ analysis_output = {
                     "latest_left_yoy": round(latest_left, 2),
                     "latest_right_yoy": round(latest_right, 2),
                     "latest_inflation_gap": round(latest_gap, 2),
-                    "five_year_average_gap": round(avg_gap, 2),
-                    "overlap_periods": len(yoy_rows),
+                    "average_gap": round(avg_gap, 2),
+                    "overlap_periods": overlap_n,
+                    "yoy_start": yoy_start,
+                    "yoy_end": yoy_end,
                     "end_date": latest["date"],
                     "latest_common_raw_month": latest_raw_month,
                 }
@@ -525,14 +541,14 @@ analysis_output = {
             "source_series": list(series_ids),
         },
         {
-            "name": "five_year_average_gap_percent",
+            "name": "average_yoy_gap_percent",
             "value": round(avg_gap, 2),
             "unit": "percentage points",
             "source_series": list(series_ids),
         },
         {
             "name": "overlap_periods",
-            "value": len(yoy_rows),
+            "value": overlap_n,
             "unit": "periods",
             "source_series": list(series_ids),
         },
@@ -575,8 +591,9 @@ analysis_output = {
         "Year-over-year percent uses the same calendar month minus 12 months "
         "via date keys (YYYY-MM), never a positional 12-row shift. A month is "
         "kept only when that series has both the current observation and the "
-        "prior-year month; series are then inner-joined on those dates. Latest "
-        "common raw month is "
+        "prior-year month; series are then inner-joined on those dates. "
+        + window_note
+        + ". Latest common raw month is "
         + latest_raw_month
         + ". Index bases differ, so raw levels are not compared on one axis."
     ),
@@ -593,8 +610,13 @@ def comparison_draft(analysis: AnalysisArtifact) -> DraftArtifact:
     left_yoy = metrics_by_name.get("latest_left_yoy_percent", {})
     right_yoy = metrics_by_name.get("latest_right_yoy_percent", {})
     gap = metrics_by_name.get("latest_inflation_gap_percent", {})
-    avg_gap = metrics_by_name.get("five_year_average_gap_percent", {})
+    avg_gap = (
+        metrics_by_name.get("average_yoy_gap_percent")
+        or metrics_by_name.get("five_year_average_gap_percent")
+        or {}
+    )
     overlap = metrics_by_name.get("overlap_periods", {})
+    window_start, window_end = _chart_window(analysis)
     source_series = [
         str(item)
         for item in gap.get("source_series") or []
@@ -626,12 +648,30 @@ def comparison_draft(analysis: AnalysisArtifact) -> DraftArtifact:
             "year-over-year percent changes."
         )
     avg_bit = ""
-    if isinstance(avg_gap.get("value"), (int, float)):
-        avg_bit = (
-            f" Over the overlapping window the average gap was about "
-            f"{round(float(avg_gap['value']), 2)} percentage points."
-        )
     overlap_n = overlap.get("value")
+    try:
+        overlap_months = int(overlap_n) if overlap_n is not None else None
+    except (TypeError, ValueError):
+        overlap_months = None
+    if isinstance(avg_gap.get("value"), (int, float)):
+        gap_txt = f"{round(float(avg_gap['value']), 2)} percentage points"
+        if overlap_months is not None and overlap_months >= 60:
+            avg_bit = f" Over the last five years the average gap was about {gap_txt}."
+        elif window_start and window_end:
+            month_bit = (
+                f", {overlap_months} months" if overlap_months is not None else ""
+            )
+            avg_bit = (
+                f" Over the overlapping year-over-year window "
+                f"({window_start[:7]} to {window_end[:7]}{month_bit}) "
+                f"the average gap was about {gap_txt}."
+            )
+            if overlap_months is not None and overlap_months < 60:
+                avg_bit += " That is not a five-year average."
+        else:
+            avg_bit = f" Over the overlapping window the average gap was about {gap_txt}."
+            if overlap_months is not None and overlap_months < 60:
+                avg_bit += " That is not a five-year average."
     overlap_bit = (
         f" over {overlap_n} overlapping periods" if overlap_n is not None else ""
     )
@@ -651,6 +691,7 @@ def comparison_draft(analysis: AnalysisArtifact) -> DraftArtifact:
                 "latest_inflation_gap_percent",
                 "latest_left_yoy_percent",
                 "latest_right_yoy_percent",
+                "average_yoy_gap_percent",
                 "five_year_average_gap_percent",
                 "overlap_periods",
             )
@@ -828,3 +869,18 @@ def _chart_paths(analysis: AnalysisArtifact) -> list[str]:
         for chart in analysis.charts[:1]
         if isinstance(chart, dict)
     ]
+
+
+def _chart_window(analysis: AnalysisArtifact) -> tuple[str | None, str | None]:
+    for chart in analysis.charts:
+        if not isinstance(chart, dict):
+            continue
+        rows = chart.get("data") or []
+        dates = [
+            str(row.get("date") or "")[:10]
+            for row in rows
+            if isinstance(row, dict) and row.get("date")
+        ]
+        if dates:
+            return dates[0], dates[-1]
+    return None, None

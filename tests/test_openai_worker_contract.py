@@ -563,6 +563,70 @@ def test_comparison_analysis_code_runs_for_cpi_and_pce() -> None:
     assert source_series >= {"CPIAUCSL", "PCEPI"}
     assert "calendar month minus 12" in analysis.method_notes
     assert "positional" in analysis.method_notes
+    assert "average_yoy_gap_percent" in metric_names
+    assert "five_year_average_gap_percent" not in metric_names
+    if int(next(m["value"] for m in analysis.metrics if m["name"] == "overlap_periods")) < 60:
+        assert "not a five-year average" in analysis.method_notes
+
+
+def test_comparison_draft_does_not_call_short_window_a_five_year_average() -> None:
+    from workers.analysis_templates import comparison_draft
+
+    analysis = AnalysisArtifact(
+        tables=[],
+        metrics=[
+            {
+                "name": "latest_left_yoy_percent",
+                "value": 3.1,
+                "unit": "percent",
+                "source_series": ["CPIAUCSL"],
+            },
+            {
+                "name": "latest_right_yoy_percent",
+                "value": 2.8,
+                "unit": "percent",
+                "source_series": ["PCEPI"],
+            },
+            {
+                "name": "latest_inflation_gap_percent",
+                "value": 0.3,
+                "unit": "percentage points",
+                "source_series": ["CPIAUCSL", "PCEPI"],
+            },
+            {
+                "name": "average_yoy_gap_percent",
+                "value": 0.4,
+                "unit": "percentage points",
+                "source_series": ["CPIAUCSL", "PCEPI"],
+            },
+            {
+                "name": "overlap_periods",
+                "value": 46,
+                "unit": "periods",
+                "source_series": ["CPIAUCSL", "PCEPI"],
+            },
+        ],
+        claims=[],
+        charts=[
+            {
+                "type": "line",
+                "data": [
+                    {"date": "2022-09-01", "CPIAUCSL_yoy": 3.0, "PCEPI_yoy": 2.6},
+                    {"date": "2026-07-01", "CPIAUCSL_yoy": 3.1, "PCEPI_yoy": 2.8},
+                ],
+            }
+        ],
+        method_notes="calendar month minus 12",
+        warnings=[],
+    )
+
+    draft = comparison_draft(analysis)
+    lowered = draft.answer.lower()
+    assert "last five years" not in lowered
+    assert "2022-09" in draft.answer
+    assert "2026-07" in draft.answer
+    assert "46" in draft.answer
+    assert "not a five-year average" in lowered
 
 
 def test_comparison_template_uses_calendar_yoy_when_a_month_is_missing() -> None:

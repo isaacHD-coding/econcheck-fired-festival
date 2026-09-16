@@ -5,6 +5,7 @@ from pathlib import Path
 import json
 
 import harness.orchestrator as orchestrator_module
+from harness.domain import years_ago
 from harness.orchestrator import Orchestrator
 from harness.state import RunState, Stage
 from harness.tools.fred import SeriesSearchResult
@@ -832,6 +833,93 @@ def test_comparison_checker_failures_do_not_loop_openai_codegen(
     assert orchestrator._comparison_checker_codegen_retries <= 2
     assert final_state.retry_count < 6
     assert sum(1 for alarm in final_state.alarms if alarm.type == "checker_failed") <= 2
+
+
+def test_cpi_pce_last_five_years_fetch_starts_at_least_six_years_ago(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    starts: list[object] = []
+
+    def fake_fetch(series_ids, *, api_key=None, observation_start=None):
+        starts.append(observation_start)
+        return _fetch_cpi_and_pce(series_ids, api_key=api_key, observation_start=observation_start)
+
+    monkeypatch.setattr(orchestrator_module, "fred_search", _search_cpi_and_pce)
+    monkeypatch.setattr(orchestrator_module, "fred_fetch", fake_fetch)
+
+    state = RunState("cpi-pce-lookback", CPI_PCE_QUESTION, Stage.INPUT, 0)
+    final_state = Orchestrator(
+        state,
+        runs_dir=tmp_path,
+        worker=MockWorker(),
+        checker=MockChecker(),
+        fred_api_key="judge-key",
+        deadline_seconds=None,
+    ).run()
+
+    assert final_state.current_stage is Stage.RELEASED
+    assert starts
+    start = starts[0]
+    if hasattr(start, "isoformat"):
+        start_date = start
+    else:
+        start_date = date.fromisoformat(str(start)[:10])
+    assert start_date <= years_ago(6)
+
+
+def test_checker_data_discovery_retry_does_not_loop_on_unchanged_window(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    starts: list[object] = []
+
+    class WindowChecker:
+        def review(self, state, plan, data, analysis, draft):
+            return CheckerArtifact(
+                passed=False,
+                issues=["YoY overlap is shorter than five years; refetch longer history."],
+                retry_from="data_discovery",
+                explanation="Need more raw months for five years of YoY.",
+            )
+
+    def fake_fetch(series_ids, *, api_key=None, observation_start=None):
+        starts.append(observation_start)
+        return _fetch_cpi_and_pce(series_ids, api_key=api_key, observation_start=observation_start)
+
+    monkeypatch.setattr(orchestrator_module, "fred_search", _search_cpi_and_pce)
+    monkeypatch.setattr(orchestrator_module, "fred_fetch", fake_fetch)
+
+    state = RunState(
+        "data-discovery-loop",
+        CPI_PCE_QUESTION,
+        Stage.INPUT,
+        0,
+        max_turns=6,
+    )
+    orchestrator = Orchestrator(
+        state,
+        runs_dir=tmp_path,
+        worker=MockWorker(),
+        checker=WindowChecker(),
+        fred_api_key="judge-key",
+        deadline_seconds=None,
+    )
+    final_state = orchestrator.run()
+
+    assert final_state.current_stage is Stage.ESCALATED
+    assert len(starts) <= 2
+    assert orchestrator._checker_data_discovery_retries <= 2
+    assert final_state.retry_count < 6
+    assert len(set(_start_iso(item) for item in starts)) == len(starts)
+    if len(starts) == 2:
+        assert _start_iso(starts[1]) < _start_iso(starts[0])
+
+
+def _start_iso(value) -> str:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)[:10]
 
 
 def _positional_yoy_code() -> str:

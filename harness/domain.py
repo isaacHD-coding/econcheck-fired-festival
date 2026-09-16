@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import date
+import re
 from typing import Any
 
 
@@ -38,6 +40,40 @@ _COMPARISON_TERMS = (
 
 CPI_PCE_SERIES = ("CPIAUCSL", "PCEPI")
 INFLATION_GDP_SERIES = ("CPIAUCSL", "GDPC1")
+
+DEFAULT_REQUESTED_WINDOW_YEARS = 5
+YOY_RAW_HISTORY_BONUS_YEARS = 2
+MAX_RAW_HISTORY_YEARS = 20
+
+_NUMERIC_WINDOW_RE = re.compile(
+    r"(?:last|past|over|previous|prior)\s+(?:the\s+)?(\d+)\s*(?:year|yr)s?",
+    re.IGNORECASE,
+)
+_WORD_WINDOW_RE = re.compile(
+    r"(?:last|past|over|previous|prior)\s+(?:the\s+)?"
+    r"(one|two|three|four|five|six|seven|eight|nine|ten)\s+years?",
+    re.IGNORECASE,
+)
+_WORD_YEARS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+_YOY_TERMS = (
+    "yoy",
+    "year-over-year",
+    "year over year",
+    "year over-year",
+    "12-month",
+    "12 month",
+)
 
 
 def normalize_question(question: str) -> str:
@@ -100,6 +136,62 @@ def is_cpi_question(question: str) -> bool:
 
 def _mentions_gdp(text: str) -> bool:
     return "gdp" in text or "gross domestic" in text
+
+
+def requested_window_years(question: str, plan: Any = None) -> int:
+    """Parse N from 'last N years' in the question or plan. Default 5."""
+
+    blob = f"{question} {_plan_text(plan)}"
+    match = _NUMERIC_WINDOW_RE.search(blob)
+    if match:
+        return max(1, min(int(match.group(1)), MAX_RAW_HISTORY_YEARS))
+    match = _WORD_WINDOW_RE.search(blob)
+    if match:
+        return _WORD_YEARS[match.group(1).lower()]
+    return DEFAULT_REQUESTED_WINDOW_YEARS
+
+
+def needs_yoy_raw_history(question: str, plan: Any = None) -> bool:
+    """True when N years of inflation rates / YoY need more than N years of levels."""
+
+    if is_comparison_question(question):
+        return True
+    blob = f" {normalize_question(question)} {_plan_text(plan)} "
+    return any(term in blob for term in _YOY_TERMS)
+
+
+def raw_history_years(question: str, plan: Any = None, extra_years: int = 0) -> int:
+    """Raw FRED lookback in years. YoY of N years fetches N+2 (plus retry extras)."""
+
+    requested = requested_window_years(question, plan)
+    years = requested
+    if needs_yoy_raw_history(question, plan):
+        years = requested + YOY_RAW_HISTORY_BONUS_YEARS
+    years += max(0, int(extra_years))
+    return max(1, min(years, MAX_RAW_HISTORY_YEARS))
+
+
+def years_ago(years: int, today: date | None = None) -> date:
+    today = today or date.today()
+    try:
+        return today.replace(year=today.year - int(years))
+    except ValueError:
+        return today.replace(month=2, day=28, year=today.year - int(years))
+
+
+def observation_start_for_fetch(
+    question: str,
+    plan: Any = None,
+    *,
+    today: date | None = None,
+    extra_years: int = 0,
+) -> date:
+    """Earliest FRED observation_start for this question/plan."""
+
+    return years_ago(
+        raw_history_years(question, plan, extra_years=extra_years),
+        today,
+    )
 
 
 def plan_requests_relationship(plan: Any) -> bool:

@@ -25,7 +25,14 @@ from harness.checkpoints import (
     SourceProvenanceCheckpoint,
     SuccessCriteriaCheckpoint,
 )
-from harness.domain import CPI_PCE_SERIES, is_comparison_question
+from harness.domain import (
+    CPI_PCE_SERIES,
+    is_comparison_question,
+    needs_yoy_raw_history,
+    observation_start_for_fetch,
+    raw_history_years,
+    requested_window_years,
+)
 from harness.guardrails import INPUT_GUARDRAILS, PLANNING_GUARDRAILS
 from harness.persistence import save_artifact, save_run_state, save_text_artifact
 from harness.state import RunState, Stage
@@ -75,6 +82,7 @@ DEFAULT_RUN_DEADLINE_SECONDS = 180.0
 MAX_OPENAI_TIMEOUT_RETRIES_PER_STAGE = 1
 MIN_TIMEOUT_RETRY_SECONDS = 15.0
 MAX_COMPARISON_CHECKER_CODEGEN_RETRIES = 2
+MAX_CHECKER_DATA_DISCOVERY_RETRIES = 2
 
 
 class StageControl(Exception):
@@ -115,6 +123,9 @@ class Orchestrator:
         self._comparison_codegen_fallback_used = False
         self._force_comparison_template = False
         self._comparison_checker_codegen_retries = 0
+        self._checker_data_discovery_retries = 0
+        self._fetch_lookback_extra_years = 0
+        self._last_fetch_observation_start: str | None = None
         self._checks: list[dict[str, Any]] = []
         self._guardrails: list[dict[str, Any]] = []
         self._timeline: list[dict[str, Any]] = []
@@ -429,11 +440,16 @@ class Orchestrator:
                 retry_from="data_discovery",
             )
 
+        observation_start = observation_start_for_fetch(
+            self.state.question,
+            plan,
+            extra_years=self._fetch_lookback_extra_years,
+        )
         try:
             data = fred_fetch(
                 selected_ids,
                 api_key=self.fred_api_key,
-                observation_start=_five_years_ago(),
+                observation_start=observation_start,
             )
         except FredConfigurationError as exc:
             self._fail_with_alarm(
@@ -451,7 +467,19 @@ class Orchestrator:
                 retry_from="data_discovery",
             )
 
+        self._last_fetch_observation_start = observation_start.isoformat()
+        data.metadata = dict(data.metadata or {})
         data.metadata["selected_series"] = selection.selected_series
+        data.metadata["observation_start"] = self._last_fetch_observation_start
+        data.metadata["requested_window_years"] = requested_window_years(
+            self.state.question,
+            plan,
+        )
+        data.metadata["raw_lookback_years"] = raw_history_years(
+            self.state.question,
+            plan,
+            extra_years=self._fetch_lookback_extra_years,
+        )
         self._save_json_artifact("data", data)
 
         self._run_data_checks(selection, data, flattened_results)
@@ -625,6 +653,8 @@ class Orchestrator:
 
         if not checker_artifact.passed:
             retry_from = checker_artifact.retry_from or "draft_answer"
+            if retry_from == "data_discovery":
+                self._cap_or_widen_data_discovery_retry(plan, checker_artifact)
             if (
                 retry_from == "code_generation"
                 and _comparison_codegen_fallback_eligible(self.state.question, plan, data)
@@ -653,6 +683,48 @@ class Orchestrator:
                 retry_from=retry_from,
             )
         return checker_artifact
+
+    def _cap_or_widen_data_discovery_retry(
+        self,
+        plan: PlannerArtifact,
+        checker_artifact: CheckerArtifact,
+    ) -> None:
+        """Stop identical FRED refetches; widen YoY lookback at most once more."""
+
+        self._checker_data_discovery_retries += 1
+        proposed_extra = self._fetch_lookback_extra_years
+        if needs_yoy_raw_history(self.state.question, plan):
+            proposed_extra = self._fetch_lookback_extra_years + 1
+        proposed_start = observation_start_for_fetch(
+            self.state.question,
+            plan,
+            extra_years=proposed_extra,
+        ).isoformat()
+        unchanged = (
+            self._last_fetch_observation_start is not None
+            and proposed_start == self._last_fetch_observation_start
+        )
+        if (
+            self._checker_data_discovery_retries >= MAX_CHECKER_DATA_DISCOVERY_RETRIES
+            or unchanged
+        ):
+            self._fail_with_alarm(
+                type="checker_failed",
+                message=(
+                    "Checker requested data_discovery again without a wider fetch "
+                    "window. Stopped instead of repeating the same FRED lookback."
+                ),
+                context={
+                    **checker_artifact.to_dict(),
+                    "last_observation_start": self._last_fetch_observation_start,
+                    "proposed_observation_start": proposed_start,
+                    "unchanged_fetch_window": unchanged,
+                    "data_discovery_retries": self._checker_data_discovery_retries,
+                },
+                retry_from="data_discovery",
+                recommended_action="escalate",
+            )
+        self._fetch_lookback_extra_years = proposed_extra
 
     def _release_answer(
         self,
@@ -1192,16 +1264,6 @@ class Orchestrator:
 
     def _run_dir(self) -> Path:
         return self.runs_dir / self.state.run_id
-
-
-def _five_years_ago():
-    from datetime import date
-
-    today = date.today()
-    try:
-        return today.replace(year=today.year - 5)
-    except ValueError:
-        return today.replace(month=2, day=28, year=today.year - 5)
 
 
 def _comparison_codegen_fallback_eligible(

@@ -212,7 +212,7 @@ def _comparison_brief(
     return ChartBriefArtifact(
         claim=(
             f"The gap between {title_left} inflation and {title_right} inflation "
-            "over the overlapping five-year window."
+            "over the overlapping year-over-year window."
         ),
         series_ids=list(series_ids),
         transforms=["yoy"],
