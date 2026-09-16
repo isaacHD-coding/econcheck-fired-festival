@@ -143,6 +143,21 @@ class ChartPromiseCheckpoint:
                 message="Analysis must include chart descriptor data.",
                 retry_from="code_generation",
             )
+        descriptors = [
+            chart
+            for chart in charts
+            if isinstance(chart, dict) and isinstance(chart.get("data"), list)
+        ]
+        if not descriptors:
+            return CheckpointResult.fail_result(
+                checkpoint_name=self.__class__.__name__,
+                stage="code_generation",
+                message=(
+                    "Analysis charts must be a list of descriptors with a data "
+                    "array of dated rows. Do not use nested charts[].series."
+                ),
+                retry_from="code_generation",
+            )
         return CheckpointResult.pass_result("Analysis includes chart descriptor data.")
 
 

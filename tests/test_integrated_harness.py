@@ -471,13 +471,32 @@ def test_write_code_failures_stop_at_max_turns(monkeypatch, tmp_path: Path) -> N
 
             return CodeArtifact(code="raise RuntimeError('forced codegen failure')")
 
-    monkeypatch.setattr(orchestrator_module, "fred_search", _search_cpi_and_pce)
-    monkeypatch.setattr(orchestrator_module, "fred_fetch", _fetch_cpi_and_pce)
+    def fake_search(query: str, *, api_key: str | None = None):
+        return [
+            SeriesSearchResult(
+                series_id="UNRATE",
+                title="Unemployment Rate",
+                frequency="Monthly",
+                units="Percent",
+                observation_start="1948-01-01",
+                observation_end="2026-08-01",
+            )
+        ]
+
+    def fake_fetch(series_ids, *, api_key=None, observation_start=None):
+        return DataArtifact(
+            series_ids=list(series_ids),
+            observations={series_id: _fresh_rows(series_id) for series_id in series_ids},
+            metadata={"source": "FRED", "series": {}},
+        )
+
+    monkeypatch.setattr(orchestrator_module, "fred_search", fake_search)
+    monkeypatch.setattr(orchestrator_module, "fred_fetch", fake_fetch)
 
     max_turns = 2
     state = RunState(
         "codegen-loop",
-        CPI_PCE_QUESTION,
+        UNEMPLOYMENT_QUESTION,
         Stage.INPUT,
         0,
         max_turns=max_turns,
@@ -494,19 +513,22 @@ def test_write_code_failures_stop_at_max_turns(monkeypatch, tmp_path: Path) -> N
 
     assert final_state.current_stage is Stage.ESCALATED
     assert orchestrator._write_code_attempts <= max_turns + 1
+    assert orchestrator._comparison_codegen_fallback_used is False
     assert final_state.retry_count > max_turns
 
 
 def test_oversized_generated_code_is_not_executed(monkeypatch, tmp_path: Path) -> None:
-    from harness.orchestrator import StageControl
     from workers.artifacts import CodeArtifact, PlannerArtifact
     from workers.chart_briefs import build_chart_brief
 
-    executed = {"n": 0}
+    executed_oversize = {"n": 0}
+    real_run = orchestrator_module.run_analysis_code
 
-    def fake_run(*args, **kwargs):
-        executed["n"] += 1
-        raise AssertionError("sandbox must not run oversized analysis code")
+    def fake_run(code_artifact, data, **kwargs):
+        if "helper_0" in code_artifact.code or "unused_0 =" in code_artifact.code:
+            executed_oversize["n"] += 1
+            raise AssertionError("sandbox must not run oversized analysis code")
+        return real_run(code_artifact, data, **kwargs)
 
     monkeypatch.setattr(orchestrator_module, "run_analysis_code", fake_run)
 
@@ -551,20 +573,148 @@ def test_oversized_generated_code_is_not_executed(monkeypatch, tmp_path: Path) -
         fred_api_key="judge-key",
         deadline_seconds=None,
     )
-    try:
-        orchestrator._code_generation_stage(plan, data)
-        raised = False
-    except StageControl:
-        raised = True
+    analysis = orchestrator._code_generation_stage(plan, data)
 
-    assert raised is True
-    assert executed["n"] == 0
+    assert executed_oversize["n"] == 0
+    assert orchestrator._comparison_codegen_fallback_used is True
+    assert analysis.charts
     assert any(
-        check["name"] == "CodeSimplicityCheckpoint" and not check["passed"]
-        for check in orchestrator._checks
+        isinstance(metric, dict) and isinstance(metric.get("value"), (int, float))
+        for metric in analysis.metrics
     )
-    assert any(alarm.type == "code_simplicity_failed" for alarm in orchestrator.state.alarms)
     assert (tmp_path / "verbose-codegen" / "generated_code.py").is_file()
+    generated = (tmp_path / "verbose-codegen" / "generated_code.py").read_text()
+    assert "helper_0" not in generated
+    assert "latest_inflation_gap_percent" in generated
+
+
+def test_schema_mismatch_analysis_falls_back_to_comparison_template(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class SchemaMismatchWorker(MockWorker):
+        def write_code(self, plan, data, chart_brief=None):
+            from workers.artifacts import CodeArtifact
+
+            return CodeArtifact(
+                code=(
+                    "analysis_output = {\n"
+                    "  'tables': [{'name': 'wide', 'rows': []}],\n"
+                    "  'metrics': [{'label': 'gap', 'stat': '0.3'}],\n"
+                    "  'claims': [],\n"
+                    "  'charts': [{\n"
+                    "    'title': 'CPI vs PCE',\n"
+                    "    'series': [{'id': 'CPIAUCSL', 'points': []}],\n"
+                    "  }],\n"
+                    "  'method_notes': 'nested custom schema',\n"
+                    "  'warnings': [],\n"
+                    "}\n"
+                )
+            )
+
+    monkeypatch.setattr(orchestrator_module, "fred_search", _search_cpi_and_pce)
+    monkeypatch.setattr(orchestrator_module, "fred_fetch", _fetch_cpi_and_pce)
+
+    state = RunState(
+        "schema-mismatch",
+        CPI_PCE_QUESTION,
+        Stage.INPUT,
+        0,
+        max_turns=3,
+    )
+    orchestrator = Orchestrator(
+        state,
+        runs_dir=tmp_path,
+        worker=SchemaMismatchWorker(),
+        checker=MockChecker(),
+        fred_api_key="judge-key",
+        deadline_seconds=None,
+    )
+    final_state = orchestrator.run()
+
+    assert final_state.current_stage is Stage.RELEASED
+    assert orchestrator._write_code_attempts == 1
+    assert orchestrator._comparison_codegen_fallback_used is True
+    assert final_state.retry_count == 0
+    analysis = json.loads((tmp_path / "schema-mismatch" / "analysis.json").read_text())
+    values = [
+        metric.get("value")
+        for metric in analysis["metrics"]
+        if isinstance(metric, dict) and isinstance(metric.get("value"), (int, float))
+    ]
+    assert values
+    assert analysis["charts"]
+    assert isinstance(analysis["charts"][0].get("data"), list)
+    generated = (tmp_path / "schema-mismatch" / "generated_code.py").read_text()
+    assert "latest_inflation_gap_percent" in generated
+    assert "charts[].series" not in generated
+
+
+def test_empty_metrics_missing_charts_retry_is_bounded_for_single_series(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class EmptyAnalysisWorker(MockWorker):
+        def write_code(self, plan, data, chart_brief=None):
+            from workers.artifacts import CodeArtifact
+
+            return CodeArtifact(
+                code=(
+                    "analysis_output = {"
+                    "'tables': [], 'metrics': [{'name': 'gap'}], "
+                    "'claims': [], 'charts': [], "
+                    "'method_notes': 'empty', 'warnings': []}"
+                )
+            )
+
+    def fake_search(query: str, *, api_key: str | None = None):
+        return [
+            SeriesSearchResult(
+                series_id="UNRATE",
+                title="Unemployment Rate",
+                frequency="Monthly",
+                units="Percent",
+                observation_start="1948-01-01",
+                observation_end="2026-08-01",
+            )
+        ]
+
+    def fake_fetch(series_ids, *, api_key=None, observation_start=None):
+        return DataArtifact(
+            series_ids=list(series_ids),
+            observations={series_id: _fresh_rows(series_id) for series_id in series_ids},
+            metadata={"source": "FRED", "series": {}},
+        )
+
+    monkeypatch.setattr(orchestrator_module, "fred_search", fake_search)
+    monkeypatch.setattr(orchestrator_module, "fred_fetch", fake_fetch)
+
+    max_turns = 1
+    state = RunState(
+        "empty-schema-retry",
+        UNEMPLOYMENT_QUESTION,
+        Stage.INPUT,
+        0,
+        max_turns=max_turns,
+    )
+    orchestrator = Orchestrator(
+        state,
+        runs_dir=tmp_path,
+        worker=EmptyAnalysisWorker(),
+        checker=MockChecker(),
+        fred_api_key="judge-key",
+        deadline_seconds=None,
+    )
+    final_state = orchestrator.run()
+
+    assert final_state.current_stage is Stage.ESCALATED
+    assert orchestrator._write_code_attempts <= max_turns + 1
+    assert orchestrator._comparison_codegen_fallback_used is False
+    assert final_state.retry_count > max_turns
+    assert any(
+        "MathSanity" in str(alarm.context) or alarm.type == "checkpoint_failed"
+        for alarm in final_state.alarms
+    )
 
 
 def _search_cpi_and_pce(query: str, *, api_key: str | None = None):

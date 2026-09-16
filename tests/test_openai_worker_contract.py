@@ -17,7 +17,13 @@ from workers.openai_client import (
     OPENAI_PLAN_TIMEOUT_SECONDS,
     OpenAITimeoutError,
 )
-from workers.openai_worker import OpenAIWorker, OpenAIWorkerError, OpenAIWorkerTimeoutError, WRITE_CODE_GUIDANCE
+from workers.openai_worker import (
+    OpenAIWorker,
+    OpenAIWorkerError,
+    OpenAIWorkerTimeoutError,
+    SIMPLE_RETRY_WRITE_CODE_GUIDANCE,
+    WRITE_CODE_GUIDANCE,
+)
 
 
 QUESTION = "What has happened to CPI inflation over the last five years?"
@@ -616,6 +622,10 @@ def test_write_code_guidance_keeps_generated_scripts_short() -> None:
     assert "missing-month" in lowered
     assert "pearson" in lowered
     assert "general-purpose statistics library" in lowered
+    assert "source_series" in lowered
+    assert "metric['value']" in WRITE_CODE_GUIDANCE or "value: number" in lowered
+    assert "charts[].series" in WRITE_CODE_GUIDANCE
+    assert "latest_inflation_gap_percent" in WRITE_CODE_GUIDANCE
     assert "adaptive chart design" not in lowered
     assert "correlation is acceptable" not in lowered
 
@@ -653,7 +663,45 @@ def test_openai_write_code_openai_path_uses_concise_guidance(monkeypatch) -> Non
     assert payload["codegen_constraints"]["price_index_comparison"] == (
         "yoy_percent_and_gap_only"
     )
+    assert "metrics_schema" in payload["codegen_constraints"]
+    assert "charts_schema" in payload["codegen_constraints"]
     assert isinstance(code, CodeArtifact)
+
+
+def test_openai_write_code_retry_uses_schema_simplify_prompt(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_call_openai_json(*, schema_name, instructions, input_payload, **kwargs):
+        captured["instructions"] = instructions
+        captured["payload"] = input_payload
+        return {
+            "code": (
+                "analysis_output = {"
+                "'tables': [], 'metrics': [], 'claims': [], 'charts': [], "
+                "'method_notes': 'retry', 'warnings': []}"
+            )
+        }
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = "How has the unemployment rate changed over the last five years?"
+    data = _unemployment_data()
+    data.metadata["codegen_retry"] = {
+        "failed_checks": ["MathSanityCheckpoint", "ChartPromiseCheckpoint"],
+        "instruction": "Previous analysis_output failed MathSanity and/or ChartPromise.",
+    }
+    worker.write_code(_unemployment_plan(), data)
+
+    instructions = str(captured["instructions"])
+    assert SIMPLE_RETRY_WRITE_CODE_GUIDANCE in instructions
+    assert "schema X" in instructions or "y_field" in instructions
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["codegen_retry"]["failed_checks"] == [
+        "MathSanityCheckpoint",
+        "ChartPromiseCheckpoint",
+    ]
 
 
 def test_cpi_pce_write_code_path_keeps_concise_codegen_contract(monkeypatch) -> None:

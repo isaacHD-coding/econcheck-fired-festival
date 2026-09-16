@@ -25,6 +25,7 @@ from harness.checkpoints import (
     SourceProvenanceCheckpoint,
     SuccessCriteriaCheckpoint,
 )
+from harness.domain import CPI_PCE_SERIES, is_comparison_question
 from harness.guardrails import INPUT_GUARDRAILS, PLANNING_GUARDRAILS
 from harness.persistence import save_artifact, save_run_state, save_text_artifact
 from harness.state import RunState, Stage
@@ -41,6 +42,7 @@ from workers.artifacts import (
     PlannerArtifact,
 )
 from workers.chart_briefs import build_chart_brief
+from workers.analysis_templates import comparison_analysis_code
 from workers.openai_client import (
     openai_timeout_details,
     user_facing_openai_timeout_message,
@@ -109,6 +111,7 @@ class Orchestrator:
         self._max_loop_iterations = max(8, (state.max_turns + 1) * 8)
         self._timeout_retries: dict[str, int] = {}
         self._write_code_attempts = 0
+        self._comparison_codegen_fallback_used = False
         self._checks: list[dict[str, Any]] = []
         self._guardrails: list[dict[str, Any]] = []
         self._timeline: list[dict[str, Any]] = []
@@ -488,48 +491,57 @@ class Orchestrator:
             name="CodeSimplicityCheckpoint",
             stage=Stage.CODE_GENERATION,
         )
+        analysis: AnalysisArtifact | None = None
         if not simplicity.passed:
-            alarm = simplicity.alarm
-            self._fail_with_alarm(
-                type="code_simplicity_failed",
-                message=(
-                    alarm.message
-                    if alarm is not None
-                    else "Generated analysis code is too large."
-                ),
-                context=dict(alarm.context) if alarm is not None else {},
-                retry_from="code_generation",
-            )
+            analysis = self._recover_comparison_analysis(plan, data, chart_brief)
+            if analysis is None:
+                self._mark_codegen_retry(data, ["CodeSimplicityCheckpoint"])
+                alarm = simplicity.alarm
+                self._fail_with_alarm(
+                    type="code_simplicity_failed",
+                    message=(
+                        alarm.message
+                        if alarm is not None
+                        else "Generated analysis code is too large."
+                    ),
+                    context=dict(alarm.context) if alarm is not None else {},
+                    retry_from="code_generation",
+                )
+            self._reset_code_generation_checks()
 
-        code_output_path = self._run_dir() / "code_output.json"
-        self.state.artifacts["code_output"] = "code_output.json"
-        self._persist()
-
-        try:
-            analysis = run_analysis_code(
-                code_artifact,
-                data,
-                output_log_path=code_output_path,
-            )
-        except Exception as exc:
-            self._apply_checkpoint(
-                CodeExecutionCheckpoint().evaluate({
-                    "succeeded": False,
-                    "execution_error": repr(exc),
-                }),
-                name="CodeExecutionCheckpoint",
-                stage=Stage.CODE_GENERATION,
-            )
-            self._fail_with_alarm(
-                type="code_execution_failed",
-                message="Generated analysis code failed.",
-                context={
-                    "generated_code_path": str(self._run_dir() / "generated_code.py"),
-                    "code_output_path": str(code_output_path),
-                    "error": repr(exc),
-                },
-                retry_from="code_generation",
-            )
+        if analysis is None:
+            code_output_path = self._run_dir() / "code_output.json"
+            self.state.artifacts["code_output"] = "code_output.json"
+            self._persist()
+            try:
+                analysis = run_analysis_code(
+                    code_artifact,
+                    data,
+                    output_log_path=code_output_path,
+                )
+            except Exception as exc:
+                self._apply_checkpoint(
+                    CodeExecutionCheckpoint().evaluate({
+                        "succeeded": False,
+                        "execution_error": repr(exc),
+                    }),
+                    name="CodeExecutionCheckpoint",
+                    stage=Stage.CODE_GENERATION,
+                )
+                analysis = self._recover_comparison_analysis(plan, data, chart_brief)
+                if analysis is None:
+                    self._mark_codegen_retry(data, ["CodeExecutionCheckpoint"])
+                    self._fail_with_alarm(
+                        type="code_execution_failed",
+                        message="Generated analysis code failed.",
+                        context={
+                            "generated_code_path": str(self._run_dir() / "generated_code.py"),
+                            "code_output_path": str(code_output_path),
+                            "error": repr(exc),
+                        },
+                        retry_from="code_generation",
+                    )
+                self._reset_code_generation_checks()
 
         analysis = AnalysisArtifact.from_dict(analysis.to_dict())
         from harness.charts import normalize_analysis_charts
@@ -539,6 +551,25 @@ class Orchestrator:
         self._save_json_artifact("analysis", analysis)
 
         self._run_code_checks(analysis, chart_brief=chart_brief, honesty=honesty, data=data)
+        failures = self._code_generation_failures()
+        if failures:
+            recovered = self._recover_comparison_analysis(plan, data, chart_brief)
+            if recovered is not None:
+                honesty = ChartHonestyCheckpoint().evaluate(recovered)
+                analysis = normalize_analysis_charts(recovered, chart_brief)
+                self._save_json_artifact("analysis", analysis)
+                self._reset_code_generation_checks()
+                self._run_code_checks(
+                    analysis,
+                    chart_brief=chart_brief,
+                    honesty=honesty,
+                    data=data,
+                )
+            else:
+                self._mark_codegen_retry(
+                    data,
+                    [str(item.get("name") or "") for item in failures],
+                )
         self._require_stage_checks_passed(Stage.CODE_GENERATION)
         self._append_timeline(
             "code_generation",
@@ -742,6 +773,66 @@ class Orchestrator:
             return method(plan, data, chart_brief=chart_brief)
         self._write_code_attempts += 1
         return method(plan, data)
+
+    def _recover_comparison_analysis(
+        self,
+        plan: PlannerArtifact,
+        data: DataArtifact,
+        chart_brief: ChartBriefArtifact,
+    ) -> AnalysisArtifact | None:
+        """Replace a failed OpenAI novel with the compact CPI vs PCE template once."""
+
+        if self._comparison_codegen_fallback_used:
+            return None
+        if not _comparison_codegen_fallback_eligible(self.state.question, plan, data):
+            return None
+        self._comparison_codegen_fallback_used = True
+        self._notify(
+            Stage.CODE_GENERATION.value,
+            "Using the compact CPI vs PCE template after generated analysis failed schema checks.",
+        )
+        data.metadata = dict(data.metadata or {})
+        data.metadata["chart_brief"] = chart_brief.to_dict()
+        code_artifact = CodeArtifact(code=comparison_analysis_code())
+        self._save_text_artifact("generated_code", "generated_code.py", code_artifact.code)
+        code_output_path = self._run_dir() / "code_output.json"
+        self.state.artifacts["code_output"] = "code_output.json"
+        try:
+            analysis = run_analysis_code(
+                code_artifact,
+                data,
+                output_log_path=code_output_path,
+            )
+        except Exception:
+            return None
+        return AnalysisArtifact.from_dict(analysis.to_dict())
+
+    def _mark_codegen_retry(self, data: DataArtifact, failed_checks: list[str]) -> None:
+        data.metadata = dict(data.metadata or {})
+        data.metadata["codegen_retry"] = {
+            "failed_checks": [name for name in failed_checks if name],
+            "instruction": (
+                "Previous analysis_output failed MathSanity and/or ChartPromise. "
+                "Emit minimal numeric metrics and one chart matching the harness schema."
+            ),
+        }
+        self._save_json_artifact("data", data)
+
+    def _reset_code_generation_checks(self) -> None:
+        self._checks = [
+            check
+            for check in self._checks
+            if check.get("stage") != Stage.CODE_GENERATION.value
+        ]
+        if self._checks:
+            self._save_json_artifact("checkpoint_results", {"checks": self._checks})
+
+    def _code_generation_failures(self) -> list[dict[str, Any]]:
+        return [
+            check
+            for check in self._checks
+            if check.get("stage") == Stage.CODE_GENERATION.value and not check.get("passed")
+        ]
 
     def _run_answer_checks(
         self,
@@ -1062,3 +1153,25 @@ def _five_years_ago():
         return today.replace(year=today.year - 5)
     except ValueError:
         return today.replace(month=2, day=28, year=today.year - 5)
+
+
+def _comparison_codegen_fallback_eligible(
+    question: str,
+    plan: PlannerArtifact,
+    data: DataArtifact,
+) -> bool:
+    series_ids = [str(item) for item in (data.series_ids or [])]
+    if len(series_ids) < 2:
+        return False
+    if is_comparison_question(question):
+        return True
+    if set(CPI_PCE_SERIES) <= set(series_ids):
+        return True
+    blob = " ".join(
+        [
+            str(getattr(plan, "measurement_strategy", "") or ""),
+            " ".join(str(item) for item in getattr(plan, "economic_concepts", []) or []),
+            " ".join(str(item) for item in getattr(plan, "search_queries", []) or []),
+        ]
+    ).lower()
+    return "pce" in blob or "pcepi" in blob

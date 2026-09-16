@@ -193,11 +193,18 @@ class OpenAIWorker:
         chart_brief: ChartBriefArtifact | None = None,
     ) -> CodeArtifact:
         brief = chart_brief or build_chart_brief(plan, data_summary, question=self.question)
+        retry_meta: dict[str, Any] = {}
         if hasattr(data_summary, "metadata") and isinstance(data_summary.metadata, dict):
             data_summary.metadata["chart_brief"] = brief.to_dict()
+            raw_retry = data_summary.metadata.get("codegen_retry") or {}
+            if isinstance(raw_retry, dict):
+                retry_meta = raw_retry
         template = _analysis_code_template(self.question, plan, data_summary)
         if template is not None:
             return CodeArtifact(code=template)
+        extra = WRITE_CODE_GUIDANCE
+        if retry_meta:
+            extra = SIMPLE_RETRY_WRITE_CODE_GUIDANCE + "\n" + WRITE_CODE_GUIDANCE
         payload = {
             "plan": plan.to_dict(),
             "data": _compact_data_payload(data_summary),
@@ -208,15 +215,24 @@ class OpenAIWorker:
                 "one_chart": True,
                 "follow_chart_brief": True,
                 "price_index_comparison": "yoy_percent_and_gap_only",
+                "metrics_schema": (
+                    "list of {name: str, value: number, unit: str, source_series: [FRED ids]}"
+                ),
+                "charts_schema": (
+                    "non-empty list of {type, title, x_field, y_field, series_ids, "
+                    "unit, data: [{date, ...y fields}]}"
+                ),
             },
         }
+        if retry_meta:
+            payload["codegen_retry"] = retry_meta
         return self._call_artifact(
             schema_name="code_artifact",
             schema=CODE_SCHEMA,
             instructions=_stage_instructions(
                 "Code generation",
                 "Write a short Python analysis script for the supplied DataArtifact.",
-                WRITE_CODE_GUIDANCE,
+                extra,
             ),
             input_payload=payload,
             artifact_cls=CodeArtifact,
@@ -742,11 +758,33 @@ WRITE_CODE_GUIDANCE = (
     "the inflation gap. Do not add Pearson correlation, median/mean batteries, "
     "missing-month audits, sampled-row tables, or extra charts unless the question "
     "asked for them.\n"
-    "Return Python only in the JSON code field. The code must assign "
-    "analysis_output as a dict. Top-level analysis_output['tables'], "
-    "analysis_output['metrics'], analysis_output['claims'], "
-    "analysis_output['charts'], and analysis_output['warnings'] must all be lists. "
-    "analysis_output['method_notes'] must be a string. Use only input_data. Do not "
+    "Assign analysis_output as a dict that matches the harness AnalysisArtifact "
+    "exactly. Top-level keys: tables (list), metrics (list), claims (list), "
+    "charts (list), method_notes (string), warnings (list).\n"
+    "Each metrics[] item MUST be "
+    "{name: str, value: number (not a string), unit: str, source_series: [FRED ids]}. "
+    "MathSanity reads metric['value'] as an int or float; nested stats or string "
+    "values yield empty metric_values and fail.\n"
+    "charts MUST be a non-empty list of chart descriptors. Each chart MUST be "
+    "{type: 'line'|'scatter'|'bars'|'panels', title: str, x_field: 'date', "
+    "y_field: str or [str], series_ids: [FRED ids], unit: str, "
+    "data: [{date: 'YYYY-MM-DD', <y_field>: number, ...}], notes: short caption}. "
+    "Do NOT use nested charts[].series objects. Do NOT leave charts empty. "
+    "ChartPromise requires a data array of dated rows.\n"
+    "Minimal two-index inflation example:\n"
+    "metrics = [\n"
+    "  {name: 'latest_left_yoy_percent', value: 3.1, unit: 'percent', "
+    "source_series: ['CPIAUCSL']},\n"
+    "  {name: 'latest_right_yoy_percent', value: 2.8, unit: 'percent', "
+    "source_series: ['PCEPI']},\n"
+    "  {name: 'latest_inflation_gap_percent', value: 0.3, unit: 'percentage points', "
+    "source_series: ['CPIAUCSL', 'PCEPI']}\n"
+    "]\n"
+    "charts = [{type: 'line', title: 'CPI inflation vs PCE inflation', "
+    "x_field: 'date', y_field: ['CPIAUCSL_yoy', 'PCEPI_yoy'], "
+    "series_ids: ['CPIAUCSL', 'PCEPI'], unit: 'percent', "
+    "data: [{date: '2025-01-01', CPIAUCSL_yoy: 3.1, PCEPI_yoy: 2.8}]}]\n"
+    "Return Python only in the JSON code field. Use only input_data. Do not "
     "call FRED, do not use the network, do not use subprocesses, do not install "
     "packages, and do not read or write files. Use only the Python standard library. "
     "If input_data contains more than one series, answer the user's actual question "
@@ -757,6 +795,15 @@ WRITE_CODE_GUIDANCE = (
     "English ('CPI growth', 'Real GDP growth', 'PCE inflation'). Chart notes are a "
     "short caption (units, alignment, n) only. Never put 'Do not…' harness design "
     "rules in analysis.charts notes."
+)
+
+SIMPLE_RETRY_WRITE_CODE_GUIDANCE = (
+    "RETRY: the previous analysis_output failed MathSanity (metric_values empty or "
+    "non-numeric) and/or ChartPromise (missing chart descriptors). Do not write "
+    "another open-ended novel. Emit a MINIMAL YoY+gap script: a few metrics with "
+    "numeric value fields, and one chart matching schema X "
+    "(type/title/x_field/y_field/series_ids/unit/data rows). Keep under 80 lines. "
+    "No nested charts[].series, no Pearson, no missing-month audits."
 )
 
 

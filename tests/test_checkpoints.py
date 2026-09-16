@@ -273,6 +273,92 @@ def test_math_sanity_checkpoint_rejects_non_finite_metrics():
     assert result.alarm.retry_from == "code_generation"
 
 
+def test_math_sanity_and_chart_promise_fail_on_empty_metrics_and_missing_charts():
+    analysis = AnalysisArtifact(
+        tables=[{"name": "nested", "rows": []}],
+        metrics=[{"label": "gap", "stat": "0.3"}],
+        claims=[],
+        charts=[],
+        method_notes="custom nested schema",
+        warnings=[],
+    )
+
+    math_result = MathSanityCheckpoint().evaluate(analysis)
+    chart_result = ChartPromiseCheckpoint().evaluate(analysis)
+
+    assert math_result.passed is False
+    assert math_result.alarm is not None
+    assert math_result.alarm.retry_from == "code_generation"
+    assert math_result.alarm.context["metric_values"] == []
+    assert chart_result.passed is False
+    assert chart_result.alarm is not None
+    assert chart_result.alarm.retry_from == "code_generation"
+
+
+def test_chart_promise_checkpoint_fails_nested_series_shape():
+    analysis = valid_analysis()
+    analysis.charts = [
+        {
+            "title": "CPI vs PCE",
+            "series": [
+                {"id": "CPIAUCSL", "points": [{"date": "2025-01-01", "value": 3.1}]},
+                {"id": "PCEPI", "points": [{"date": "2025-01-01", "value": 2.8}]},
+            ],
+        }
+    ]
+
+    result = ChartPromiseCheckpoint().evaluate(analysis)
+
+    assert result.passed is False
+    assert result.alarm is not None
+    assert "charts[].series" in result.alarm.message
+
+
+def test_minimal_cpi_pce_analysis_passes_math_sanity_and_chart_promise():
+    analysis = AnalysisArtifact(
+        tables=[],
+        metrics=[
+            {
+                "name": "latest_left_yoy_percent",
+                "value": 3.1,
+                "unit": "percent",
+                "source_series": ["CPIAUCSL"],
+            },
+            {
+                "name": "latest_right_yoy_percent",
+                "value": 2.8,
+                "unit": "percent",
+                "source_series": ["PCEPI"],
+            },
+            {
+                "name": "latest_inflation_gap_percent",
+                "value": 0.3,
+                "unit": "percentage points",
+                "source_series": ["CPIAUCSL", "PCEPI"],
+            },
+        ],
+        claims=[{"text": "CPI inflation is above PCE inflation.", "metric_refs": ["latest_inflation_gap_percent"]}],
+        charts=[
+            {
+                "type": "line",
+                "title": "CPI inflation vs PCE inflation",
+                "x_field": "date",
+                "y_field": ["CPIAUCSL_yoy", "PCEPI_yoy"],
+                "series_ids": ["CPIAUCSL", "PCEPI"],
+                "unit": "percent",
+                "data": [
+                    {"date": "2025-01-01", "CPIAUCSL_yoy": 3.1, "PCEPI_yoy": 2.8},
+                ],
+            }
+        ],
+        method_notes="Year-over-year percent and gap.",
+        warnings=[],
+    )
+
+    assert MathSanityCheckpoint().evaluate(analysis).passed is True
+    assert ChartPromiseCheckpoint().evaluate(analysis).passed is True
+
+
 def test_chart_promise_checkpoint_fails_without_charts():
     analysis = valid_analysis()
     analysis.charts = []
