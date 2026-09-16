@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from harness.domain import is_cpi_question
+from harness.domain import is_cpi_question, is_relationship_question
 from harness.state import RunState
+from workers.analysis_templates import relationship_analysis_code, relationship_draft
 from workers.artifacts import (
     AnalysisArtifact,
     CodeArtifact,
@@ -22,6 +23,35 @@ class MockWorker:
         question: str,
         state: RunState,
     ) -> PlannerArtifact:
+        self.question = question
+        if is_relationship_question(question):
+            return PlannerArtifact(
+                question_type="relationship",
+                economic_concepts=["inflation", "real GDP growth", "correlation"],
+                measurement_strategy=(
+                    "Search FRED for CPIAUCSL and GDPC1, align mixed frequencies, "
+                    "and measure the correlation of period-over-period growth rates."
+                ),
+                information_requirements=[
+                    "FRED CPIAUCSL observations",
+                    "FRED GDPC1 observations",
+                    "overlapping dates for a correlation estimate",
+                ],
+                search_queries=[
+                    "Consumer Price Index for All Urban Consumers All Items CPIAUCSL",
+                    "Real Gross Domestic Product GDPC1",
+                ],
+                required_outputs=[
+                    "growth-rate correlation",
+                    "overlap period count",
+                    "aligned dual-series chart",
+                ],
+                success_criteria=[
+                    "Answer reports the correlation between inflation and real GDP growth",
+                    "Answer cites generated metric names",
+                    "Answer notes alignment caveats",
+                ],
+            )
         if is_cpi_question(question):
             return PlannerArtifact(
                 question_type="trend",
@@ -84,8 +114,12 @@ class MockWorker:
             for item in search_results
             if hasattr(item, "to_dict") or isinstance(item, dict)
         ]
-        selected = _select_series(normalized, plan)
-        if selected is None:
+        selected_items = _select_series_list(
+            normalized,
+            plan,
+            getattr(self, "question", ""),
+        )
+        if not selected_items:
             return DataSelectionArtifact(
                 selected_series=[],
                 rejected_series=[
@@ -97,21 +131,19 @@ class MockWorker:
                 ),
             )
 
-        selected = dict(selected)
-        selected["reason"] = selected.get("reason") or (
-            "Best matching series from harness-provided FRED search results."
-        )
+        selected_ids = {item.get("series_id") for item in selected_items}
         rejected = [
-            {**item, "reason": item.get("reason") or "Not the selected primary series."}
+            {**item, "reason": item.get("reason") or "Not among the selected series."}
             for item in normalized
-            if item.get("series_id") != selected.get("series_id")
+            if item.get("series_id") not in selected_ids
         ]
         return DataSelectionArtifact(
-            selected_series=[selected],
+            selected_series=selected_items,
             rejected_series=rejected,
             justification=(
-                f"Selected {selected.get('series_id')} from live FRED search results "
-                "because it best matches the planner search target."
+                "Selected "
+                + ", ".join(str(item.get("series_id")) for item in selected_items)
+                + " from live FRED search results without inventing series identifiers."
             ),
         )
 
@@ -120,8 +152,11 @@ class MockWorker:
         plan: PlannerArtifact,
         data_summary: DataArtifact | dict[str, Any],
     ) -> CodeArtifact:
-        series_id = _primary_series_id(data_summary)
-        return CodeArtifact(code=_analysis_code(series_id))
+        series_ids = _series_ids(data_summary)
+        if len(series_ids) > 1:
+            return CodeArtifact(code=relationship_analysis_code())
+        series_id = series_ids[0] if series_ids else "CPIAUCSL"
+        return CodeArtifact(code=_single_series_analysis_code(series_id))
 
     def draft_answer(
         self,
@@ -133,6 +168,8 @@ class MockWorker:
             for metric in analysis.metrics
             if isinstance(metric, dict) and isinstance(metric.get("name"), str)
         ]
+        if any(name == "growth_correlation" for name in referenced_metrics):
+            return relationship_draft(analysis)
         metrics_by_name = {
             metric["name"]: metric
             for metric in analysis.metrics
@@ -183,41 +220,71 @@ class MockWorker:
         )
 
 
-def _select_series(search_results: list[dict], plan: PlannerArtifact) -> dict | None:
+def _select_series_list(
+    search_results: list[dict],
+    plan: PlannerArtifact,
+    question: str,
+) -> list[dict]:
     if not search_results:
-        return None
+        return []
 
-    if is_cpi_question(" ".join(plan.search_queries + plan.economic_concepts)):
+    if is_relationship_question(question) or plan.question_type == "relationship":
+        selected: list[dict] = []
+        for series_id in ("CPIAUCSL", "GDPC1"):
+            match = next(
+                (dict(item) for item in search_results if item.get("series_id") == series_id),
+                None,
+            )
+            if match is None:
+                continue
+            match["reason"] = match.get("reason") or (
+                f"{series_id} is present in FRED search results and needed for the relationship."
+            )
+            selected.append(match)
+        if selected:
+            return selected
+        return []
+
+    if is_cpi_question(question) or is_cpi_question(
+        " ".join(plan.search_queries + plan.economic_concepts)
+    ):
         for item in search_results:
             if item.get("series_id") == "CPIAUCSL":
-                return dict(item)
+                chosen = dict(item)
+                chosen["reason"] = "CPIAUCSL is the headline CPI index for all urban consumers."
+                return [chosen]
         for item in search_results:
             title = str(item.get("title", "")).lower()
             if (
                 "consumer price index for all urban consumers" in title
                 and "all items" in title
             ):
-                return dict(item)
+                chosen = dict(item)
+                chosen["reason"] = "Best matching all-items CPI series in search results."
+                return [chosen]
 
-    return dict(search_results[0])
+    first = dict(search_results[0])
+    first["reason"] = first.get("reason") or (
+        "Best matching series from harness-provided FRED search results."
+    )
+    return [first]
 
 
-def _primary_series_id(data_summary: DataArtifact | dict[str, Any]) -> str:
+def _series_ids(data_summary: DataArtifact | dict[str, Any]) -> list[str]:
     if hasattr(data_summary, "series_ids") and data_summary.series_ids:
-        return str(data_summary.series_ids[0])
+        return [str(item) for item in data_summary.series_ids]
     if isinstance(data_summary, dict):
         series_ids = data_summary.get("series_ids") or []
         if series_ids:
-            return str(series_ids[0])
+            return [str(item) for item in series_ids]
         observations = data_summary.get("observations") or {}
-        if observations:
-            return str(next(iter(observations)))
+        return [str(item) for item in observations]
     if hasattr(data_summary, "observations") and data_summary.observations:
-        return str(next(iter(data_summary.observations)))
-    return "CPIAUCSL"
+        return [str(item) for item in data_summary.observations]
+    return []
 
 
-def _analysis_code(series_id: str) -> str:
+def _single_series_analysis_code(series_id: str) -> str:
     cpi = series_id == "CPIAUCSL"
     five_year_name = "cpi_five_year_change_percent" if cpi else "five_year_change_percent"
     yoy_name = "latest_yoy_inflation_percent" if cpi else "latest_yoy_change_percent"

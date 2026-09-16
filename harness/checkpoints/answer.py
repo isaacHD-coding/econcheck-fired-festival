@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from harness.checkpoints.base import CheckpointResult
-from harness.domain import is_cpi_question
+from harness.domain import is_canonical_cpi_demo_question
 
 
 class AnswerGroundingCheckpoint:
@@ -72,7 +72,7 @@ class SuccessCriteriaCheckpoint:
         answer = str(_read_field(draft, "answer") or "").strip()
         referenced = _read_field(draft, "referenced_metrics") or []
         criteria = list(_read_field(plan, "success_criteria") or []) if plan is not None else []
-        needs_cpi = is_cpi_question(question) or any("cpi" in str(item).lower() for item in criteria)
+        needs_cpi = is_canonical_cpi_demo_question(question)
 
         if not answer or not referenced:
             return CheckpointResult.fail_result(

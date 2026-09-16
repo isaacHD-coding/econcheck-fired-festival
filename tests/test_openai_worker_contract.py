@@ -99,7 +99,9 @@ def test_openai_worker_recovers_canonical_cpi_selection_after_empty_model_choice
 
     monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
 
-    selection = OpenAIWorker(api_key="test-key").select_data(
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = QUESTION
+    selection = worker.select_data(
         _planner_artifact(),
         [
             {
@@ -132,7 +134,9 @@ def test_openai_worker_uses_executable_canonical_cpi_code_after_model_call(
 
     monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
 
-    code = OpenAIWorker(api_key="test-key").write_code(
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = QUESTION
+    code = worker.write_code(
         _planner_artifact(),
         _canonical_cpi_data_artifact(),
     )
@@ -164,7 +168,9 @@ def test_openai_worker_uses_grounded_canonical_cpi_draft_after_model_call(
 
     monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
 
-    draft = OpenAIWorker(api_key="test-key").draft_answer(
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = QUESTION
+    draft = worker.draft_answer(
         _planner_artifact(),
         _canonical_cpi_analysis_artifact(),
     )
@@ -177,6 +183,294 @@ def test_openai_worker_uses_grounded_canonical_cpi_draft_after_model_call(
         "latest_cpi_index",
     }
     assert draft.chart_paths == ["analysis.json#charts/0"]
+
+
+ISAAC_QUESTION = (
+    "What is the correlation (or anti correlation) between inflation and real GDP growth?"
+)
+
+
+def test_openai_worker_does_not_recover_cpi_only_selection_for_correlation_question(
+    monkeypatch,
+) -> None:
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        return {
+            "selected_series": [],
+            "rejected_series": [],
+            "justification": "Model declined to select a series.",
+        }
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = ISAAC_QUESTION
+    selection = worker.select_data(
+        _relationship_plan(),
+        [_cpi_search_result()],
+    )
+
+    assert selection.selected_series == []
+
+
+def test_openai_worker_adds_search_backed_gdp_when_model_selects_only_cpi(
+    monkeypatch,
+) -> None:
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        result = _cpi_search_result()
+        result["reason"] = "Inflation"
+        return {
+            "selected_series": [result],
+            "rejected_series": [],
+            "justification": "Model selected CPIAUCSL only.",
+        }
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = ISAAC_QUESTION
+    selection = worker.select_data(
+        _relationship_plan(),
+        [_cpi_search_result(), _gdp_search_result()],
+    )
+
+    assert {item["series_id"] for item in selection.selected_series} == {
+        "CPIAUCSL",
+        "GDPC1",
+    }
+
+
+def test_openai_worker_replaces_canonical_cpi_code_when_plan_needs_gdp(
+    monkeypatch,
+) -> None:
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        return {
+            "code": (
+                "rows = sorted(input_data['observations']['CPIAUCSL'], "
+                "key=lambda row: row['date'])\n"
+                "if len(rows) < 48:\n"
+                "    raise RuntimeError('Expected at least 48 CPI observations "
+                "for five-year analysis.')\n"
+                "analysis_output = {'tables': [], 'metrics': [], 'claims': [], "
+                "'charts': [], 'method_notes': 'canned-cpi', 'warnings': []}"
+            )
+        }
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = ISAAC_QUESTION
+    code = worker.write_code(_relationship_plan(), _cpi_and_gdp_data())
+
+    assert "Expected at least 48 CPI observations" not in code.code
+    assert "growth_correlation" in code.code
+    assert "pearson" in code.code
+
+
+def test_openai_worker_does_not_replace_multiseries_model_code_with_canonical_cpi(
+    monkeypatch,
+) -> None:
+    model_code = (
+        "analysis_output = {"
+        "'tables': [], "
+        "'metrics': [{'name': 'inflation_gdp_correlation', 'value': -0.42, "
+        "'unit': 'correlation', 'source_series': ['CPIAUCSL', 'GDPC1']}], "
+        "'claims': [{'text': 'Inflation and real GDP growth are anti-correlated.', "
+        "'metric_refs': ['inflation_gdp_correlation']}], "
+        "'charts': [{'type': 'line', 'title': 'CPIAUCSL vs GDPC1', 'data': []}], "
+        "'method_notes': 'model-correlation-code', "
+        "'warnings': []}"
+    )
+
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        assert schema_name == "code_artifact"
+        return {"code": model_code}
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = ISAAC_QUESTION
+    code = worker.write_code(_relationship_plan(), _cpi_and_gdp_data())
+
+    assert "model-correlation-code" in code.code
+    assert "GDPC1" in code.code
+    assert "Expected at least 48 CPI observations" not in code.code
+
+
+def test_openai_worker_does_not_release_canned_cpi_draft_for_correlation_question(
+    monkeypatch,
+) -> None:
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        return {
+            "answer": (
+                "Over the last five years, CPI inflation has left the CPI index "
+                "materially higher. The CPIAUCSL index increased by 21.99%."
+            ),
+            "referenced_metrics": [
+                "cpi_five_year_change_percent",
+                "latest_yoy_inflation_percent",
+                "latest_cpi_index",
+            ],
+            "chart_paths": ["analysis.json#charts/0"],
+        }
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = ISAAC_QUESTION
+    analysis = AnalysisArtifact(
+        tables=[],
+        metrics=[
+            {
+                "name": "growth_correlation",
+                "value": -0.37,
+                "unit": "correlation",
+                "source_series": ["CPIAUCSL", "GDPC1"],
+            },
+            {
+                "name": "overlap_periods",
+                "value": 19,
+                "unit": "periods",
+                "source_series": ["CPIAUCSL", "GDPC1"],
+            },
+        ],
+        claims=[],
+        charts=[{"type": "line", "data": []}],
+        method_notes="Aligned CPIAUCSL and GDPC1.",
+        warnings=[],
+    )
+
+    draft = worker.draft_answer(_relationship_plan(), analysis)
+
+    assert "materially higher" not in draft.answer
+    assert "correlation" in draft.answer.lower()
+    assert "GDPC1" in draft.answer
+    assert "growth_correlation" in draft.referenced_metrics
+
+
+def test_openai_worker_keeps_model_correlation_draft(monkeypatch) -> None:
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        return {
+            "answer": (
+                "Inflation and real GDP growth are anti-correlated over the window "
+                "based on growth_correlation."
+            ),
+            "referenced_metrics": ["growth_correlation"],
+            "chart_paths": ["analysis.json#charts/0"],
+        }
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = ISAAC_QUESTION
+    analysis = AnalysisArtifact(
+        tables=[],
+        metrics=[
+            {
+                "name": "growth_correlation",
+                "value": -0.37,
+                "unit": "correlation",
+                "source_series": ["CPIAUCSL", "GDPC1"],
+            }
+        ],
+        claims=[],
+        charts=[{"type": "line", "data": []}],
+        method_notes="model",
+        warnings=[],
+    )
+
+    draft = worker.draft_answer(_relationship_plan(), analysis)
+
+    assert "anti-correlated" in draft.answer
+    assert "materially higher" not in draft.answer
+
+
+def test_relationship_analysis_code_runs_for_cpi_and_gdp() -> None:
+    from workers.analysis_templates import relationship_analysis_code
+
+    analysis = run_analysis_code(
+        CodeArtifact(code=relationship_analysis_code()),
+        _cpi_and_gdp_data(),
+    )
+
+    metric_names = {metric["name"] for metric in analysis.metrics}
+    assert "growth_correlation" in metric_names
+    assert {metric["name"] for metric in analysis.metrics if metric.get("source_series")}
+    source_series = {
+        series_id
+        for metric in analysis.metrics
+        for series_id in metric.get("source_series", [])
+    }
+    assert source_series >= {"CPIAUCSL", "GDPC1"}
+    assert analysis.charts
+
+
+def _relationship_plan() -> PlannerArtifact:
+    return PlannerArtifact(
+        question_type="relationship",
+        economic_concepts=["inflation", "real GDP growth", "correlation"],
+        measurement_strategy="Correlate CPIAUCSL and GDPC1 growth rates.",
+        information_requirements=["CPIAUCSL", "GDPC1"],
+        search_queries=["CPIAUCSL", "Real GDP GDPC1"],
+        required_outputs=["correlation"],
+        success_criteria=["Report the inflation/GDP correlation"],
+    )
+
+
+def _cpi_search_result() -> dict:
+    return {
+        "series_id": "CPIAUCSL",
+        "title": "Consumer Price Index for All Urban Consumers: All Items",
+        "frequency": "Monthly",
+        "units": "Index 1982-1984=100",
+        "observation_start": "1947-01-01",
+        "observation_end": "2026-05-01",
+        "reason": "",
+    }
+
+
+def _gdp_search_result() -> dict:
+    return {
+        "series_id": "GDPC1",
+        "title": "Real Gross Domestic Product",
+        "frequency": "Quarterly",
+        "units": "Billions of Chained 2017 Dollars",
+        "observation_start": "1947-01-01",
+        "observation_end": "2026-04-01",
+        "reason": "",
+    }
+
+
+def _cpi_and_gdp_data() -> DataArtifact:
+    cpi_rows = []
+    gdp_rows = []
+    value = 260.0
+    gdp_value = 19000.0
+    for year in range(2021, 2027):
+        for month in range(1, 13):
+            if year == 2026 and month > 4:
+                break
+            cpi_rows.append(
+                {
+                    "series_id": "CPIAUCSL",
+                    "date": f"{year}-{month:02d}-01",
+                    "value": round(value, 3),
+                }
+            )
+            value += 0.8
+            if month in {1, 4, 7, 10}:
+                gdp_rows.append(
+                    {
+                        "series_id": "GDPC1",
+                        "date": f"{year}-{month:02d}-01",
+                        "value": round(gdp_value, 3),
+                    }
+                )
+                gdp_value += 80.0
+    return DataArtifact(
+        series_ids=["CPIAUCSL", "GDPC1"],
+        observations={"CPIAUCSL": cpi_rows, "GDPC1": gdp_rows},
+        metadata={"source": "FRED"},
+    )
 
 
 def _data_artifact() -> DataArtifact:

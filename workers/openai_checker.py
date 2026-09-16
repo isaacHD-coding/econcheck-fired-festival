@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from harness.domain import is_canonical_cpi_demo_question
 from harness.state import RunState
 from workers.artifacts import (
     AnalysisArtifact,
@@ -60,10 +61,15 @@ class OpenAIChecker:
             raise OpenAICheckerError(
                 f"OpenAI checker response did not match CheckerArtifact: {exc}"
             ) from exc
-        if not artifact.passed and _canonical_cpi_artifacts_are_grounded(
-            data=payload["data"],
-            analysis=payload["analysis"],
-            draft=payload["draft"],
+        if (
+            not artifact.passed
+            and is_canonical_cpi_demo_question(state.question)
+            and len(payload["data"].get("series_ids") or []) <= 1
+            and _canonical_cpi_artifacts_are_grounded(
+                data=payload["data"],
+                analysis=payload["analysis"],
+                draft=payload["draft"],
+            )
         ):
             return CheckerArtifact(
                 passed=True,

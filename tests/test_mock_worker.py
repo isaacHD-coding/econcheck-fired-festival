@@ -79,6 +79,48 @@ class MockWorkerTests(unittest.TestCase):
         self.assertIsInstance(artifact, DraftArtifact)
         self.assertEqual(DraftArtifact.from_dict(artifact.to_dict()), artifact)
 
+    def test_relationship_question_plans_cpi_and_gdp_without_inventing_series(self) -> None:
+        question = (
+            "What is the correlation (or anti correlation) between inflation "
+            "and real GDP growth?"
+        )
+        plan = self.worker.plan(question, self.state)
+        selection = self.worker.select_data(
+            plan,
+            [
+                {
+                    "series_id": "CPIAUCSL",
+                    "title": "Consumer Price Index for All Urban Consumers",
+                    "frequency": "Monthly",
+                    "units": "Index 1982-1984=100",
+                },
+                {
+                    "series_id": "GDPC1",
+                    "title": "Real Gross Domestic Product",
+                    "frequency": "Quarterly",
+                    "units": "Billions of Chained 2017 Dollars",
+                },
+            ],
+        )
+        empty_selection = self.worker.select_data(
+            plan,
+            [
+                {
+                    "series_id": "UNRATE",
+                    "title": "Unemployment Rate",
+                    "frequency": "Monthly",
+                    "units": "Percent",
+                }
+            ],
+        )
+
+        self.assertEqual(plan.question_type, "relationship")
+        self.assertEqual(
+            {item["series_id"] for item in selection.selected_series},
+            {"CPIAUCSL", "GDPC1"},
+        )
+        self.assertEqual(empty_selection.selected_series, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -105,13 +105,14 @@ Live tests **skip** when the matching API key is unset. They do not fail the sui
 - Alarm routing with retry from `planning`, `data_discovery`, `code_generation`, or `draft_answer`, then escalation after `max_turns`
 - Subprocess-backed analysis sandbox
 - Streamlit chat + observability for real runs under `runs/`
-- Mock worker for a reproducible CPI demo and for other questions when FRED search returns a series
-- Optional OpenAI worker/checker behind the same protocol
+- Mock worker for a reproducible CPI demo, unemployment-style single-series questions, and inflation-vs-real-GDP correlation when FRED search returns both `CPIAUCSL` and `GDPC1`
+- Optional OpenAI worker/checker behind the same protocol. Canonical CPI analysis/draft fallback is limited to the exact demo CPI question with CPI-only data; multi-series plans keep their relationship analysis.
 
 ## Remaining limitations
 
-- The mock worker is a small deterministic specialist, not a general economist. It plans CPI/inflation questions onto `CPIAUCSL` and otherwise uses the first live FRED search hit.
-- OpenAI mode still uses a canonical CPI analysis/draft fallback when the fetched series is `CPIAUCSL`, so the hackathon CPI demo stays stable.
+- The mock worker is a small deterministic specialist, not a general economist. It plans the canonical CPI demo onto `CPIAUCSL`, inflation-vs-real-GDP questions onto `CPIAUCSL`+`GDPC1` when those IDs appear in search results, and otherwise uses live search hits. It never invents series IDs.
+- OpenAI mode keeps a canonical CPI analysis/draft fallback only for the exact demo CPI question when the fetched data is CPI-only. Questions about correlation, GDP, or multiple series do not get that canned CPI paragraph.
+- Mixed-frequency relationship analysis aligns series by carrying higher-frequency values forward onto lower-frequency dates and reports contemporaneous growth-rate correlation, not a causal or full lead-lag model.
 - Data is FRED-only. Forecasting, policy advice, and non-economic questions are rejected.
 - Replay/resume from an arbitrary checkpoint, MCP, and extra data providers are out of scope.
 - There is no Vercel frontend; deploy the Streamlit app (Community Cloud, a VM, or any host that can run `streamlit run app.py`).

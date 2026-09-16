@@ -159,6 +159,20 @@ def test_information_sufficiency_requires_cpiaucsl_for_cpi_questions():
     assert result.alarm is not None
 
 
+def test_information_sufficiency_requires_two_series_for_relationship_questions():
+    result = InformationSufficiencyCheckpoint().evaluate(
+        valid_data(),
+        selected_ids=["CPIAUCSL"],
+        question=(
+            "What is the correlation (or anti correlation) between inflation "
+            "and real GDP growth?"
+        ),
+    )
+
+    assert result.passed is False
+    assert result.alarm is not None
+
+
 def test_code_execution_checkpoint_passes_plain_analysis_artifact():
     result = CodeExecutionCheckpoint().evaluate(valid_analysis())
 

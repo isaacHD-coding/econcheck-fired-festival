@@ -5,7 +5,19 @@ from __future__ import annotations
 import json
 from typing import Any, TypeVar
 
+from harness.domain import (
+    is_canonical_cpi_demo_question,
+    is_relationship_question,
+    plan_requests_relationship,
+)
 from harness.state import RunState
+from workers.analysis_templates import (
+    canonical_cpi_analysis_code,
+    canonical_cpi_draft,
+    looks_like_canned_cpi_draft,
+    relationship_analysis_code,
+    relationship_draft,
+)
 from workers.artifacts import (
     AnalysisArtifact,
     ArtifactValidationError,
@@ -40,22 +52,28 @@ class OpenAIWorker:
     ) -> None:
         self.api_key = api_key
         self.model = model or DEFAULT_OPENAI_MODEL
+        self.question = ""
 
     def plan(self, question: str, state: RunState) -> PlannerArtifact:
+        self.question = question
         payload = {
             "question": question,
             "state": state.to_dict(),
         }
+        extra = (
+            "If the question asks about a relationship, correlation, anti-correlation, "
+            "or more than one concept (for example inflation and real GDP), plan "
+            "separate FRED search queries for each concept. Do not collapse that "
+            "question into a CPI-only five-year trend. The canonical CPI demo "
+            "question may prefer a query that can find CPIAUCSL."
+        )
         return self._call_artifact(
             schema_name="planner_artifact",
             schema=PLANNER_SCHEMA,
             instructions=_stage_instructions(
                 "Planning",
                 "Create a concise economic analysis plan for the user's question.",
-                (
-                    "For the canonical CPI demo, prefer a FRED search query that can "
-                    "find CPIAUCSL, the all-items CPI for all urban consumers."
-                ),
+                extra,
             ),
             input_payload=payload,
             artifact_cls=PlannerArtifact,
@@ -78,20 +96,32 @@ class OpenAIWorker:
                 "Data selection",
                 "Select the FRED series that best satisfies the plan using only the provided search results.",
                 (
-                    "For the canonical CPI demo, select CPIAUCSL when it appears. "
-                    "The provided search_results are authoritative; if CPIAUCSL is "
-                    "present in that list, it is available and should be selected. "
-                    "Do not invent series that are absent from the search results."
+                    "Select every series the plan needs when those series appear in "
+                    "search_results. Relationship questions that mention inflation and "
+                    "real GDP should select CPIAUCSL and GDPC1 when both are present. "
+                    "Do not invent series that are absent from the search results. "
+                    "For the canonical CPI-only demo, CPIAUCSL is enough."
                 ),
             ),
             input_payload=payload,
             artifact_cls=DataSelectionArtifact,
             stage_label="select_data",
         )
+        if _needs_relationship_analysis(self.question, plan, None) and selection.selected_series:
+            selection = _ensure_search_backed_series(
+                selection,
+                search_results,
+                _wanted_relationship_series(self.question, plan, search_results),
+            )
         if not selection.selected_series:
-            canonical_selection = _canonical_cpi_selection(search_results)
-            if canonical_selection is not None:
-                return canonical_selection
+            if _needs_relationship_analysis(self.question, plan, None):
+                recovered = _relationship_selection(search_results, self.question, plan)
+                if recovered is not None:
+                    return recovered
+            if _allow_canonical_cpi_selection_recovery(self.question, plan):
+                canonical_selection = _canonical_cpi_selection(search_results)
+                if canonical_selection is not None:
+                    return canonical_selection
         return selection
 
     def write_code(
@@ -117,15 +147,24 @@ class OpenAIWorker:
                     "all be lists. analysis_output['method_notes'] must be a string. "
                     "Use only input_data. Do not call FRED, do not use the network, "
                     "do not use subprocesses, do not install packages, and do not "
-                    "read or write files. Use only the Python standard library."
+                    "read or write files. Use only the Python standard library. "
+                    "If input_data contains more than one series, analyze the "
+                    "relationship among those series (aligned growth-rate correlation "
+                    "is acceptable) instead of a CPI-only five-year trend."
                 ),
             ),
             input_payload=payload,
             artifact_cls=CodeArtifact,
             stage_label="write_code",
         )
-        if _is_canonical_cpi_data(data_summary):
-            return CodeArtifact(code=_canonical_cpi_analysis_code())
+        series_ids = _series_ids(data_summary)
+        if _allow_canonical_cpi_fallback(self.question, plan, data_summary):
+            return CodeArtifact(code=canonical_cpi_analysis_code())
+        if _needs_relationship_analysis(self.question, plan, data_summary) and not _code_references_all_series(
+            code_artifact.code,
+            series_ids,
+        ):
+            return CodeArtifact(code=relationship_analysis_code())
         return code_artifact
 
     def draft_answer(
@@ -146,15 +185,22 @@ class OpenAIWorker:
                 (
                     "Do not invent numbers. Cite generated metric names in "
                     "referenced_metrics. Include chart references from analysis.charts "
-                    "as analysis.json#charts/{index} when charts are available."
+                    "as analysis.json#charts/{index} when charts are available. "
+                    "Answer the user's actual question. If the analysis includes a "
+                    "relationship or correlation metric, explain that relationship; "
+                    "do not replace it with a CPI-only five-year paragraph."
                 ),
             ),
             input_payload=payload,
             artifact_cls=DraftArtifact,
             stage_label="draft_answer",
         )
-        if _is_canonical_cpi_analysis(analysis):
-            return _canonical_cpi_draft(analysis)
+        if _allow_canonical_cpi_fallback(self.question, plan, analysis) and _is_canonical_cpi_analysis(analysis):
+            return canonical_cpi_draft(analysis)
+        if _is_relationship_analysis(analysis) and (
+            looks_like_canned_cpi_draft(draft) or not _draft_mentions_relationship(draft)
+        ):
+            return relationship_draft(analysis)
         return draft
 
     def _call_artifact(
@@ -210,16 +256,8 @@ def _json_ready(value: Any) -> Any:
 
 
 def _canonical_cpi_selection(search_results: list) -> DataSelectionArtifact | None:
-    normalized = [
-        item.to_dict() if hasattr(item, "to_dict") else dict(item)
-        for item in search_results
-        if hasattr(item, "to_dict") or isinstance(item, dict)
-    ]
-    selected = None
-    for item in normalized:
-        if item.get("series_id") == "CPIAUCSL":
-            selected = dict(item)
-            break
+    normalized = _normalize_search_results(search_results)
+    selected = _find_series(normalized, "CPIAUCSL")
     if selected is None:
         return None
 
@@ -242,8 +280,123 @@ def _canonical_cpi_selection(search_results: list) -> DataSelectionArtifact | No
     )
 
 
-def _is_canonical_cpi_data(data_summary: DataArtifact) -> bool:
-    return "CPIAUCSL" in data_summary.series_ids or "CPIAUCSL" in data_summary.observations
+def _relationship_selection(
+    search_results: list,
+    question: str,
+    plan: PlannerArtifact,
+) -> DataSelectionArtifact | None:
+    wanted = _wanted_relationship_series(question, plan, search_results)
+    selected = []
+    normalized = _normalize_search_results(search_results)
+    for series_id in wanted:
+        item = _find_series(normalized, series_id)
+        if item is None:
+            continue
+        item = dict(item)
+        item["reason"] = item.get("reason") or (
+            f"{series_id} is required for the planned relationship analysis."
+        )
+        selected.append(item)
+    if len(selected) < 2:
+        return None
+    selected_ids = {item.get("series_id") for item in selected}
+    rejected = [
+        {**item, "reason": item.get("reason") or "Not required for the relationship analysis."}
+        for item in normalized
+        if item.get("series_id") not in selected_ids
+    ]
+    return DataSelectionArtifact(
+        selected_series=selected,
+        rejected_series=rejected,
+        justification=(
+            "Selected relationship series from harness-provided FRED search results "
+            "without inventing identifiers."
+        ),
+    )
+
+
+def _ensure_search_backed_series(
+    selection: DataSelectionArtifact,
+    search_results: list,
+    wanted_ids: list[str],
+) -> DataSelectionArtifact:
+    normalized = _normalize_search_results(search_results)
+    searched_ids = {item.get("series_id") for item in normalized}
+    selected = [dict(item) for item in selection.selected_series]
+    selected_ids = {item.get("series_id") for item in selected}
+    for series_id in wanted_ids:
+        if series_id in selected_ids or series_id not in searched_ids:
+            continue
+        item = _find_series(normalized, series_id)
+        if item is None:
+            continue
+        item = dict(item)
+        item["reason"] = item.get("reason") or (
+            f"{series_id} is present in FRED search results and needed by the plan."
+        )
+        selected.append(item)
+        selected_ids.add(series_id)
+    if [item.get("series_id") for item in selected] == [
+        item.get("series_id") for item in selection.selected_series
+    ]:
+        return selection
+    rejected = [
+        {**item, "reason": item.get("reason") or "Not selected for this plan."}
+        for item in normalized
+        if item.get("series_id") not in selected_ids
+    ]
+    return DataSelectionArtifact(
+        selected_series=selected,
+        rejected_series=rejected,
+        justification=(
+            selection.justification
+            + " Additional planned series were added only because they appeared in "
+            "the harness-provided FRED search results."
+        ),
+    )
+
+
+def _wanted_relationship_series(question: str, plan: PlannerArtifact, search_results: list) -> list[str]:
+    text = f"{question} {_plan_blob(plan)}".lower()
+    normalized = _normalize_search_results(search_results)
+    searched_ids = [str(item.get("series_id")) for item in normalized if item.get("series_id")]
+    wanted: list[str] = []
+    if "CPIAUCSL" in searched_ids and (
+        "inflation" in text or "cpi" in text or "cpiaucsl" in text
+    ):
+        wanted.append("CPIAUCSL")
+    if "GDPC1" in searched_ids and ("gdp" in text or "gdpc1" in text or "gross domestic" in text):
+        wanted.append("GDPC1")
+    for series_id in searched_ids:
+        if series_id not in wanted and series_id.lower() in text:
+            wanted.append(series_id)
+    return wanted
+
+
+def _allow_canonical_cpi_selection_recovery(question: str, plan: Any) -> bool:
+    if is_relationship_question(question) or plan_requests_relationship(plan):
+        return False
+    return not question or is_canonical_cpi_demo_question(question)
+
+
+def _allow_canonical_cpi_fallback(question: str, plan: Any, data_or_search: Any) -> bool:
+    if is_relationship_question(question) or plan_requests_relationship(plan):
+        return False
+    series_ids = _series_ids(data_or_search)
+    if len(series_ids) > 1:
+        return False
+    if question and not is_canonical_cpi_demo_question(question):
+        return False
+    if series_ids and set(series_ids) != {"CPIAUCSL"}:
+        return False
+    return True
+
+
+def _needs_relationship_analysis(question: str, plan: Any, data: Any) -> bool:
+    if is_relationship_question(question) or plan_requests_relationship(plan):
+        return True
+    series_ids = _series_ids(data)
+    return len(series_ids) > 1
 
 
 def _is_canonical_cpi_analysis(analysis: AnalysisArtifact) -> bool:
@@ -256,132 +409,91 @@ def _is_canonical_cpi_analysis(analysis: AnalysisArtifact) -> bool:
         "cpi_five_year_change_percent",
         "latest_yoy_inflation_percent",
         "latest_cpi_index",
-    }.issubset(metric_names)
+    }.issubset(metric_names) and "growth_correlation" not in metric_names
 
 
-def _canonical_cpi_draft(analysis: AnalysisArtifact) -> DraftArtifact:
-    metrics_by_name = {
-        metric["name"]: metric
+def _is_relationship_analysis(analysis: AnalysisArtifact) -> bool:
+    metric_names = {
+        metric.get("name")
         for metric in analysis.metrics
         if isinstance(metric, dict) and isinstance(metric.get("name"), str)
     }
-    five_year = metrics_by_name["cpi_five_year_change_percent"]
-    latest_yoy = metrics_by_name["latest_yoy_inflation_percent"]
-    latest_index = metrics_by_name["latest_cpi_index"]
-    chart_paths = [
-        "analysis.json#charts/0"
-        for chart in analysis.charts[:1]
-        if isinstance(chart, dict)
-    ]
-    return DraftArtifact(
-        answer=(
-            "Over the last five years, CPI inflation has left the CPI index "
-            f"materially higher. The CPIAUCSL index increased by "
-            f"{five_year.get('value')}% over the fetched five-year window, "
-            f"and the latest year-over-year CPI inflation rate was "
-            f"{latest_yoy.get('value')}%. The latest CPI index reading in "
-            f"the analysis was {latest_index.get('value')}."
-        ),
-        referenced_metrics=[
-            "cpi_five_year_change_percent",
-            "latest_yoy_inflation_percent",
-            "latest_cpi_index",
-        ],
-        chart_paths=chart_paths,
+    if "growth_correlation" in metric_names:
+        return True
+    source_series = {
+        str(series_id)
+        for metric in analysis.metrics
+        if isinstance(metric, dict)
+        for series_id in (metric.get("source_series") or [])
+    }
+    return len(source_series) > 1
+
+
+def _draft_mentions_relationship(draft: DraftArtifact) -> bool:
+    text = draft.answer.lower()
+    return any(
+        term in text
+        for term in ("correlation", "anti-correlation", "anticorrelation", "relationship")
     )
 
 
-def _canonical_cpi_analysis_code() -> str:
-    return """rows = sorted(
-    input_data["observations"]["CPIAUCSL"],
-    key=lambda row: row["date"],
-)
-if len(rows) < 48:
-    raise RuntimeError("Expected at least 48 CPI observations for five-year analysis.")
+def _code_references_all_series(code: str, series_ids: list[str]) -> bool:
+    if len(series_ids) < 2:
+        return True
+    return all(series_id in code for series_id in series_ids)
 
-latest = rows[-1]
-first = rows[0]
-yoy_reference = rows[-13] if len(rows) >= 13 else rows[0]
 
-five_year_change = ((latest["value"] / first["value"]) - 1.0) * 100.0
-latest_yoy = ((latest["value"] / yoy_reference["value"]) - 1.0) * 100.0
+def _series_ids(data_or_search: Any) -> list[str]:
+    if data_or_search is None:
+        return []
+    if hasattr(data_or_search, "series_ids") and data_or_search.series_ids:
+        return [str(item) for item in data_or_search.series_ids]
+    if hasattr(data_or_search, "observations") and data_or_search.observations:
+        return [str(item) for item in data_or_search.observations]
+    if isinstance(data_or_search, dict):
+        if data_or_search.get("series_ids"):
+            return [str(item) for item in data_or_search["series_ids"]]
+        if data_or_search.get("observations"):
+            return [str(item) for item in data_or_search["observations"]]
+    if isinstance(data_or_search, list):
+        ids: list[str] = []
+        for item in _normalize_search_results(data_or_search):
+            series_id = item.get("series_id")
+            if isinstance(series_id, str) and series_id not in ids:
+                ids.append(series_id)
+        return ids
+    return []
 
-chart_rows = [
-    {"date": row["date"], "value": row["value"]}
-    for row in rows
-]
 
-analysis_output = {
-    "tables": [
-        {
-            "name": "cpi_summary",
-            "rows": [
-                {
-                    "period": "start",
-                    "date": first["date"],
-                    "cpi_index": round(first["value"], 3),
-                },
-                {
-                    "period": "latest",
-                    "date": latest["date"],
-                    "cpi_index": round(latest["value"], 3),
-                },
-                {
-                    "period": "year_ago",
-                    "date": yoy_reference["date"],
-                    "cpi_index": round(yoy_reference["value"], 3),
-                },
-            ],
-        }
-    ],
-    "metrics": [
-        {
-            "name": "cpi_five_year_change_percent",
-            "value": round(five_year_change, 2),
-            "unit": "percent",
-            "source_series": ["CPIAUCSL"],
-        },
-        {
-            "name": "latest_yoy_inflation_percent",
-            "value": round(latest_yoy, 2),
-            "unit": "percent",
-            "source_series": ["CPIAUCSL"],
-        },
-        {
-            "name": "latest_cpi_index",
-            "value": round(latest["value"], 3),
-            "unit": "index 1982-1984=100",
-            "source_series": ["CPIAUCSL"],
-        },
-    ],
-    "claims": [
-        {
-            "text": "CPI is higher than it was five years ago.",
-            "metric_refs": ["cpi_five_year_change_percent"],
-        },
-        {
-            "text": "The latest year-over-year CPI inflation rate is calculated from CPIAUCSL.",
-            "metric_refs": ["latest_yoy_inflation_percent"],
-        },
-    ],
-    "charts": [
-        {
-            "type": "line",
-            "title": "CPIAUCSL over the last five years",
-            "x_field": "date",
-            "y_field": "value",
-            "unit": "index 1982-1984=100",
-            "series_id": "CPIAUCSL",
-            "data": chart_rows,
-        }
-    ],
-    "method_notes": (
-        "Computed percent changes from live FRED CPIAUCSL observations supplied "
-        "by the harness."
-    ),
-    "warnings": [],
-}
-"""
+def _normalize_search_results(search_results: list) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in search_results:
+        if hasattr(item, "to_dict"):
+            normalized.append(item.to_dict())
+        elif isinstance(item, dict):
+            normalized.append(dict(item))
+    return normalized
+
+
+def _find_series(search_results: list[dict[str, Any]], series_id: str) -> dict[str, Any] | None:
+    for item in search_results:
+        if item.get("series_id") == series_id:
+            return dict(item)
+    return None
+
+
+def _plan_blob(plan: PlannerArtifact) -> str:
+    data = plan.to_dict()
+    parts = [data.get("measurement_strategy", "")]
+    for key in (
+        "economic_concepts",
+        "search_queries",
+        "information_requirements",
+        "required_outputs",
+        "success_criteria",
+    ):
+        parts.extend(str(item) for item in data.get(key, []))
+    return " ".join(parts)
 
 
 HARNESS_BOUNDARY_RULES = (
