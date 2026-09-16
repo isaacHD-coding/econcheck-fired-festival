@@ -166,11 +166,74 @@ relationship = (
     else "little contemporaneous correlation"
 )
 chart_rows = [
+    {
+        "date": current["date"],
+        f"{left_id}_growth": round(growth[left_id][index], 4),
+        f"{right_id}_growth": round(growth[right_id][index], 4),
+    }
+    for index, current in enumerate(aligned[1:])
+]
+level_rows = [
     {"date": item["date"], left_id: item[left_id], right_id: item[right_id]}
     for item in aligned
 ]
 latest = aligned[-1]
 first = aligned[0]
+
+
+def amplitude(values):
+    peaks = [abs(value) for value in values if value is not None]
+    return max(peaks) if peaks else 1.0
+
+left_amp = amplitude([item[left_id] for item in aligned])
+right_amp = amplitude([item[right_id] for item in aligned])
+levels_incompatible = (
+    min(left_amp, right_amp) > 0
+    and max(left_amp, right_amp) / min(left_amp, right_amp) >= 10.0
+)
+growth_chart = {
+    "type": "line",
+    "layout": "single",
+    "shared_y_axis": True,
+    "title": f"Period-over-period growth in {left_id} and {right_id}",
+    "x_field": "date",
+    "y_field": [f"{left_id}_growth", f"{right_id}_growth"],
+    "unit": "percent",
+    "y_label": "percent change",
+    "series_id": ",".join(series_ids),
+    "data": chart_rows,
+    "notes": (
+        "Growth rates share a percent axis so the correlation is visually readable. "
+        "Raw levels are not forced onto one scale."
+    ),
+}
+if levels_incompatible:
+    levels_chart = {
+        "type": "line",
+        "layout": "dual_axis",
+        "shared_y_axis": False,
+        "title": f"{left_id} and {right_id} levels (dual axis)",
+        "x_field": "date",
+        "y_field": [left_id, right_id],
+        "y_left": left_id,
+        "y_right": right_id,
+        "y_left_label": left_id,
+        "y_right_label": right_id,
+        "series_id": ",".join(series_ids),
+        "data": level_rows,
+        "notes": "Independent y-axes because the native units differ by an order of magnitude.",
+    }
+else:
+    levels_chart = {
+        "type": "line",
+        "layout": "single",
+        "shared_y_axis": True,
+        "title": f"{left_id} and {right_id} over the overlapping window",
+        "x_field": "date",
+        "y_field": [left_id, right_id],
+        "series_id": ",".join(series_ids),
+        "data": level_rows,
+    }
 
 analysis_output = {
     "tables": [
@@ -224,14 +287,8 @@ analysis_output = {
         }
     ],
     "charts": [
-        {
-            "type": "line",
-            "title": f"{left_id} and {right_id} over the overlapping window",
-            "x_field": "date",
-            "y_field": [left_id, right_id],
-            "series_id": ",".join(series_ids),
-            "data": chart_rows,
-        }
+        growth_chart,
+        levels_chart,
     ],
     "method_notes": (
         "Aligned the lower-frequency series dates with last-observation-carried-forward "

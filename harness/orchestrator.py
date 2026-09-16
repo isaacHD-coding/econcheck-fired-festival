@@ -487,6 +487,9 @@ class Orchestrator:
             )
 
         analysis = AnalysisArtifact.from_dict(analysis.to_dict())
+        from harness.charts import normalize_analysis_charts
+
+        analysis = normalize_analysis_charts(analysis)
         self._save_json_artifact("analysis", analysis)
 
         self._run_code_checks(analysis)

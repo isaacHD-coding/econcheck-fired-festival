@@ -402,6 +402,12 @@ def test_relationship_analysis_code_runs_for_cpi_and_gdp() -> None:
     }
     assert source_series >= {"CPIAUCSL", "GDPC1"}
     assert analysis.charts
+    primary = analysis.charts[0]
+    from harness.charts import normalize_chart, would_dwarf_a_series, y_fields
+
+    normalized = normalize_chart(primary)
+    assert would_dwarf_a_series(normalized) is False
+    assert any("growth" in field for field in y_fields(normalized)) or normalized.get("layout") == "dual_axis"
 
 
 def _relationship_plan() -> PlannerArtifact:

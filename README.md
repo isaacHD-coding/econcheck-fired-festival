@@ -108,13 +108,14 @@ Live tests **skip** when the matching API key is unset. They do not fail the sui
 - Streamlit chat + observability for real runs under `runs/`
 - Mock worker for a reproducible CPI demo, unemployment-style single-series questions, and inflation-vs-real-GDP correlation when FRED search returns both `CPIAUCSL` and `GDPC1`
 - Optional OpenAI worker/checker behind the same protocol. Canonical CPI analysis/draft fallback is limited to the exact demo CPI question with CPI-only data; multi-series plans keep their relationship analysis.
+- Mixed-scale charts: correlation/growth questions plot period-over-period percent growth on a shared percent axis; incompatible raw levels (CPI index vs GDP in billions) use dual y-axes instead of one crushed overlay.
 
 ## Remaining limitations
 
 - The mock worker is a small deterministic specialist, not a general economist. It plans the canonical CPI demo onto `CPIAUCSL`, inflation-vs-real-GDP questions onto `CPIAUCSL`+`GDPC1` when those IDs appear in search results, and otherwise uses live search hits. It never invents series IDs.
 - OpenAI mode keeps a canonical CPI analysis/draft fallback only for the exact demo CPI question when the fetched data is CPI-only. Questions about correlation, GDP, or multiple series do not get that canned CPI paragraph.
 - OpenAI calls are capped at 30 seconds each (SDK retries disabled, wait happens off the Streamlit script thread). A live OpenAI run should finish or escalate within about three minutes; if the model is slow you may see a `run_deadline_exceeded` or OpenAI timeout alarm instead of a hang. Ctrl+C persists a `run_interrupted` alarm and re-raises so “Stopping…” does not wait on a blocking HTTP call.
-- Mixed-frequency relationship analysis aligns series by carrying higher-frequency values forward onto lower-frequency dates and reports contemporaneous growth-rate correlation, not a causal or full lead-lag model.
+- Mixed-frequency relationship analysis aligns series by carrying higher-frequency values forward onto lower-frequency dates and reports contemporaneous growth-rate correlation, not a causal or full lead-lag model. The default relationship chart is the two growth-rate series (same percent scale); a dual-axis levels chart is included when native units differ by an order of magnitude.
 - Data is FRED-only. Forecasting, policy advice, and non-economic questions are rejected.
 - Replay/resume from an arbitrary checkpoint, MCP, and extra data providers are out of scope.
 - There is no Vercel frontend; deploy the Streamlit app (Community Cloud, a VM, or any host that can run `streamlit run app.py`).
@@ -126,6 +127,7 @@ app/chat.py                 Streamlit chat entrypoint
 app/observability.py        Live run artifact viewer
 pages/2_Observability.py    Streamlit multipage wrapper
 harness/orchestrator.py     State machine, guardrails, checkpoints, release
+harness/charts.py           Mixed-scale chart layout + Streamlit rendering
 harness/tools/fred.py       Live FRED search/fetch
 harness/tools/code_runner.py
 harness/config.py           Env / secrets resolution

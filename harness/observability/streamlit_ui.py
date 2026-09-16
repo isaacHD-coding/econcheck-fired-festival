@@ -33,23 +33,9 @@ def render_answer(st: Any, run: RunArtifacts) -> None:
 
 
 def render_chart(st: Any, run: RunArtifacts) -> None:
-    charts = chart_specs(run)
-    if not charts:
-        st.info("No chart artifact is available for this run.")
-        return
+    from harness.charts import render_charts
 
-    chart = charts[0]
-    st.markdown(f"**{chart.get('title', 'Chart')}**")
-    data = chart.get("data", [])
-    if data:
-        st.line_chart(
-            data,
-            x=chart.get("x", "date"),
-            y=chart.get("y", "value"),
-            width="stretch",
-        )
-    with st.expander("Chart artifact JSON"):
-        st.json(chart)
+    render_charts(st, chart_specs(run))
 
 
 def render_timeline_selector(st: Any, run: RunArtifacts) -> str:

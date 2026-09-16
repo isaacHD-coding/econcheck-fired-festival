@@ -302,32 +302,13 @@ def _render_answer(view: dict) -> None:
 
 
 def _render_chart(view: dict) -> None:
+    from harness.charts import render_charts
+
     analysis = view["artifacts"].get("analysis.json")
     if not isinstance(analysis, dict):
         st.info("No analysis artifact is available yet.")
         return
-
-    charts = analysis.get("charts", [])
-    if not charts:
-        st.info("No chart artifact is available for this run.")
-        return
-
-    chart = charts[0]
-    if not isinstance(chart, dict):
-        st.json(chart)
-        return
-
-    st.markdown(f"**{chart.get('title', 'Chart')}**")
-    data = chart.get("data", [])
-    if data:
-        st.line_chart(
-            data,
-            x=chart.get("x_field", chart.get("x", "date")),
-            y=chart.get("y_field", chart.get("y", "value")),
-            width="stretch",
-        )
-    with st.expander("Chart artifact JSON"):
-        st.json(chart)
+    render_charts(st, analysis.get("charts", []))
 
 
 if __name__ == "__main__":

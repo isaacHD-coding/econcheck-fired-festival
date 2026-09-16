@@ -150,7 +150,13 @@ class OpenAIWorker:
                     "read or write files. Use only the Python standard library. "
                     "If input_data contains more than one series, analyze the "
                     "relationship among those series (aligned growth-rate correlation "
-                    "is acceptable) instead of a CPI-only five-year trend."
+                    "is acceptable) instead of a CPI-only five-year trend. "
+                    "Chart design: never overlay raw series with incompatible scales "
+                    "(for example CPI index vs GDP in billions) on one shared y-axis. "
+                    "For correlation / growth questions, plot period-over-period percent "
+                    "growth for both series on one percent axis. For mixed-unit levels, "
+                    "set layout to dual_axis with y_left and y_right (or stacked panels). "
+                    "Set shared_y_axis to false whenever two series would dwarf each other."
                 ),
             ),
             input_payload=payload,
