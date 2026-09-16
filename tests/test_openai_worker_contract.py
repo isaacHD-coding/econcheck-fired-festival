@@ -13,7 +13,13 @@ from workers.artifacts import (
 )
 from workers.base import Worker
 from harness.tools.code_runner import run_analysis_code
-from workers.openai_worker import OpenAIWorker, OpenAIWorkerError
+from workers.openai_client import (
+    OPENAI_DESIGN_CHART_TIMEOUT_SECONDS,
+    OPENAI_PLAN_TIMEOUT_SECONDS,
+    OPENAI_WRITE_CODE_TIMEOUT_SECONDS,
+    OpenAITimeoutError,
+)
+from workers.openai_worker import OpenAIWorker, OpenAIWorkerError, OpenAIWorkerTimeoutError
 
 
 QUESTION = "What has happened to CPI inflation over the last five years?"
@@ -82,6 +88,82 @@ def test_openai_worker_malformed_model_json_raises_clear_error(monkeypatch) -> N
 
     with pytest.raises(OpenAIWorkerError, match="plan response did not match"):
         worker.plan(QUESTION, state)
+
+
+def test_openai_worker_passes_stage_specific_timeouts(monkeypatch) -> None:
+    captured: dict[str, float] = {}
+    responses = {
+        "planner_artifact": {
+            "question_type": "trend",
+            "economic_concepts": ["inflation"],
+            "measurement_strategy": "Measure CPI.",
+            "information_requirements": ["FRED CPI series"],
+            "search_queries": ["CPIAUCSL"],
+            "required_outputs": ["five-year CPI change"],
+            "success_criteria": ["Answer is grounded"],
+        },
+        "code_artifact": {
+            "code": (
+                "analysis_output = {"
+                "'tables': [], 'metrics': [], 'claims': [], 'charts': [], "
+                "'method_notes': 'computed from input_data', 'warnings': []}"
+            )
+        },
+        "chart_brief_artifact": {
+            "claim": "CPI rose.",
+            "series_ids": ["CPIAUCSL"],
+            "transforms": ["none"],
+            "layout": "single",
+            "y_starts_at_zero": False,
+            "time_window_rationale": "Last five years.",
+            "annotations": [],
+            "title": "CPI",
+            "x_label": "Date",
+            "y_label": "Index",
+            "units": "index",
+            "notes": "CPIAUCSL",
+            "chart_type": "line",
+            "y_left_label": "",
+            "y_right_label": "",
+            "design_notes": "",
+        },
+    }
+
+    def fake_call_openai_json(*, schema_name, timeout_seconds, **kwargs):
+        captured[schema_name] = timeout_seconds
+        return responses[schema_name]
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    state = RunState("openai-timeouts", QUESTION, Stage.PLANNING, 0)
+    plan = worker.plan(QUESTION, state)
+    worker.design_chart(plan, _data_artifact())
+    worker.write_code(plan, _data_artifact())
+
+    assert captured["planner_artifact"] == OPENAI_PLAN_TIMEOUT_SECONDS
+    assert captured["chart_brief_artifact"] == OPENAI_DESIGN_CHART_TIMEOUT_SECONDS
+    assert captured["code_artifact"] == OPENAI_WRITE_CODE_TIMEOUT_SECONDS
+
+
+def test_openai_worker_timeout_raises_friendly_error(monkeypatch) -> None:
+    def fake_call_openai_json(**kwargs):
+        raise OpenAITimeoutError(
+            "code_artifact",
+            OPENAI_WRITE_CODE_TIMEOUT_SECONDS,
+            stage_label="write_code",
+        )
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    with pytest.raises(OpenAIWorkerTimeoutError, match="Code generation took longer than 120") as err:
+        worker.write_code(_planner_artifact(), _data_artifact())
+
+    assert "did not match" not in str(err.value)
+    assert "OpenAIWorkerError" not in str(err.value)
+    assert err.value.timeout_seconds == OPENAI_WRITE_CODE_TIMEOUT_SECONDS
+    assert err.value.stage_label == "write_code"
 
 
 def test_openai_worker_recovers_canonical_cpi_selection_after_empty_model_choice(

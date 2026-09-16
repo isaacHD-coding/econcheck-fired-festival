@@ -11,7 +11,8 @@ from workers.artifacts import (
     DraftArtifact,
     PlannerArtifact,
 )
-from workers.openai_checker import OpenAIChecker, OpenAICheckerError
+from workers.openai_checker import OpenAIChecker, OpenAICheckerError, OpenAICheckerTimeoutError
+from workers.openai_client import OPENAI_CHECKER_TIMEOUT_SECONDS, OpenAITimeoutError
 
 
 def test_openai_checker_accepts_passing_review(monkeypatch) -> None:
@@ -92,6 +93,29 @@ def test_openai_checker_rejects_unknown_retry_target(monkeypatch) -> None:
             retry_from="checker_review",
             explanation="Invalid target.",
         )
+
+
+def test_openai_checker_timeout_raises_friendly_error(monkeypatch) -> None:
+    def fake_call_openai_json(**kwargs):
+        raise OpenAITimeoutError(
+            "checker_artifact",
+            OPENAI_CHECKER_TIMEOUT_SECONDS,
+            stage_label="review",
+        )
+
+    monkeypatch.setattr("workers.openai_checker.call_openai_json", fake_call_openai_json)
+
+    with pytest.raises(OpenAICheckerTimeoutError, match="Review took longer than 30") as err:
+        OpenAIChecker(api_key="test-key").review(
+            _state(),
+            _plan(),
+            _data(),
+            _analysis(),
+            _draft(),
+        )
+
+    assert "did not match" not in str(err.value)
+    assert err.value.timeout_seconds == OPENAI_CHECKER_TIMEOUT_SECONDS
 
 
 def test_openai_checker_accepts_grounded_canonical_cpi_after_model_failure(

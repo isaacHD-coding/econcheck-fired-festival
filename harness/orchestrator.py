@@ -40,6 +40,10 @@ from workers.artifacts import (
     PlannerArtifact,
 )
 from workers.chart_briefs import build_chart_brief
+from workers.openai_client import (
+    openai_timeout_details,
+    user_facing_openai_timeout_message,
+)
 
 
 TERMINAL_STAGES = {Stage.RELEASED, Stage.ESCALATED}
@@ -60,8 +64,13 @@ RETRY_STAGES = {
     "draft_answer": Stage.DRAFT_ANSWER,
 }
 
-# Whole-run wall clock. Each OpenAI call has a 30s hard timeout on a daemon thread.
+# Whole-run wall clock. Per-call OpenAI hard timeouts are stage-specific
+# (see workers.openai_client.OPENAI_TIMEOUT_SECONDS_BY_STAGE): plan/select/draft
+# 30s, design_chart 60s, write_code 120s. Calls are also capped by remaining
+# run budget so a slow codegen retry cannot hang past this deadline.
 DEFAULT_RUN_DEADLINE_SECONDS = 180.0
+MAX_OPENAI_TIMEOUT_RETRIES_PER_STAGE = 1
+MIN_TIMEOUT_RETRY_SECONDS = 15.0
 
 
 class StageControl(Exception):
@@ -97,6 +106,7 @@ class Orchestrator:
         )
         self._loop_iterations = 0
         self._max_loop_iterations = max(8, (state.max_turns + 1) * 8)
+        self._timeout_retries: dict[str, int] = {}
         self._checks: list[dict[str, Any]] = []
         self._guardrails: list[dict[str, Any]] = []
         self._timeline: list[dict[str, Any]] = []
@@ -219,14 +229,13 @@ class Orchestrator:
             except Exception as exc:
                 if self.state.current_stage is not Stage.ESCALATED:
                     try:
-                        self._fail_with_alarm(
-                            type="stage_failed",
-                            message=f"{self.state.current_stage.value} failed: {exc}",
-                            context={"error": repr(exc)},
-                            retry_from=self._retry_from_current_stage(),
-                            recommended_action="escalate",
-                        )
-                    except StageControl:
+                        self._handle_stage_exception(exc)
+                    except StageControl as control:
+                        if (
+                            control.action == "retry"
+                            and self.state.current_stage not in TERMINAL_STAGES
+                        ):
+                            continue
                         return self.state
                 return self.state
         return self.state
@@ -853,6 +862,7 @@ class Orchestrator:
         self._persist_alarms()
 
     def _raise_if_over_budget(self) -> None:
+        self._apply_openai_timeout_cap()
         if self._loop_iterations > self._max_loop_iterations:
             self._fail_with_alarm(
                 type="run_iteration_limit",
@@ -954,6 +964,68 @@ class Orchestrator:
         }:
             return self.state.current_stage.value
         return "draft_answer"
+
+    def _remaining_deadline_seconds(self) -> float | None:
+        if self._deadline_at is None:
+            return None
+        return max(0.0, self._deadline_at - time.monotonic())
+
+    def _apply_openai_timeout_cap(self) -> None:
+        remaining = self._remaining_deadline_seconds()
+        for actor in (self.worker, self.checker):
+            setter = getattr(actor, "set_call_timeout_cap", None)
+            if callable(setter):
+                setter(remaining)
+
+    def _should_retry_openai_timeout(self, stage: str) -> bool:
+        if self._timeout_retries.get(stage, 0) >= MAX_OPENAI_TIMEOUT_RETRIES_PER_STAGE:
+            return False
+        if self.state.retry_count >= self.state.max_turns:
+            return False
+        remaining = self._remaining_deadline_seconds()
+        if remaining is not None and remaining < MIN_TIMEOUT_RETRY_SECONDS:
+            return False
+        return True
+
+    def _handle_stage_exception(self, exc: Exception) -> None:
+        details = openai_timeout_details(exc)
+        if details is None:
+            self._fail_with_alarm(
+                type="stage_failed",
+                message=f"{self.state.current_stage.value} failed: {exc}",
+                context={"error": repr(exc)},
+                retry_from=self._retry_from_current_stage(),
+                recommended_action="escalate",
+            )
+            return
+
+        stage = self.state.current_stage.value
+        stage_key = details["stage_label"] or details["schema_name"] or stage
+        timeout_seconds = float(details["timeout_seconds"])
+        can_retry = self._should_retry_openai_timeout(stage)
+        message = user_facing_openai_timeout_message(stage_key, timeout_seconds)
+        if can_retry:
+            message += " Retrying this stage once."
+            self._timeout_retries[stage] = self._timeout_retries.get(stage, 0) + 1
+            self._notify(stage, message)
+            recommended_action = "retry"
+        else:
+            message += " The run was stopped instead of waiting forever."
+            recommended_action = "escalate"
+
+        self._fail_with_alarm(
+            type="stage_timeout",
+            message=message,
+            context={
+                "error": repr(exc),
+                "timeout_seconds": timeout_seconds,
+                "stage_label": details["stage_label"],
+                "schema_name": details["schema_name"],
+                "timeout_retry": can_retry,
+            },
+            retry_from=self._retry_from_current_stage(),
+            recommended_action=recommended_action,
+        )
 
     def _run_dir(self) -> Path:
         return self.runs_dir / self.state.run_id

@@ -7,18 +7,31 @@ import pytest
 
 import harness.orchestrator as orchestrator_module
 from harness.checkpoints.base import CheckpointResult
-from harness.orchestrator import Orchestrator
 from harness.state import RunState, Stage
 from harness.tools.fred import SeriesSearchResult
 from workers.artifacts import DataArtifact
 from workers.mock_checker import MockChecker
 from workers.mock_worker import MockWorker
+from harness.orchestrator import (
+    DEFAULT_RUN_DEADLINE_SECONDS,
+    MAX_OPENAI_TIMEOUT_RETRIES_PER_STAGE,
+    MIN_TIMEOUT_RETRY_SECONDS,
+    Orchestrator,
+)
 from workers.openai_client import (
     DEFAULT_OPENAI_MAX_RETRIES,
     DEFAULT_OPENAI_TIMEOUT_SECONDS,
-    OpenAIClientError,
+    OPENAI_DESIGN_CHART_TIMEOUT_SECONDS,
+    OPENAI_DRAFT_TIMEOUT_SECONDS,
+    OPENAI_PLAN_TIMEOUT_SECONDS,
+    OPENAI_SELECT_DATA_TIMEOUT_SECONDS,
+    OPENAI_WRITE_CODE_TIMEOUT_SECONDS,
+    OpenAITimeoutError,
     call_openai_json,
+    openai_timeout_seconds,
+    user_facing_openai_timeout_message,
 )
+from workers.openai_worker import OpenAIWorkerTimeoutError
 
 
 ISAAC_QUESTION = (
@@ -228,7 +241,7 @@ def test_call_openai_json_hard_timeout_returns_before_blocking_create_finishes(
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
 
-    with pytest.raises(OpenAIClientError, match="timed out"):
+    with pytest.raises(OpenAITimeoutError, match="timed out"):
         call_openai_json(
             schema_name="probe",
             schema={"type": "object"},
@@ -239,6 +252,174 @@ def test_call_openai_json_hard_timeout_returns_before_blocking_create_finishes(
         )
 
     assert time.monotonic() - started < 1.5
+
+
+def test_stage_timeout_config_gives_codegen_a_longer_budget() -> None:
+    assert OPENAI_WRITE_CODE_TIMEOUT_SECONDS == 120.0
+    assert OPENAI_DESIGN_CHART_TIMEOUT_SECONDS == 60.0
+    assert OPENAI_PLAN_TIMEOUT_SECONDS == 30.0
+    assert OPENAI_SELECT_DATA_TIMEOUT_SECONDS == 30.0
+    assert OPENAI_DRAFT_TIMEOUT_SECONDS == 30.0
+    assert openai_timeout_seconds(stage_label="write_code") == 120.0
+    assert openai_timeout_seconds(schema_name="code_artifact") == 120.0
+    assert openai_timeout_seconds(stage_label="design_chart") == 60.0
+    assert openai_timeout_seconds(stage_label="plan") == 30.0
+    assert openai_timeout_seconds(stage_label="select_data") == 30.0
+    assert openai_timeout_seconds(stage_label="draft_answer") == 30.0
+    assert openai_timeout_seconds(schema_name="checker_artifact") == 30.0
+    assert openai_timeout_seconds(stage_label="write_code", cap_seconds=40.0) == 40.0
+    assert openai_timeout_seconds(stage_label="plan", cap_seconds=40.0) == 30.0
+    assert DEFAULT_RUN_DEADLINE_SECONDS == 180.0
+    assert MAX_OPENAI_TIMEOUT_RETRIES_PER_STAGE == 1
+    assert MIN_TIMEOUT_RETRY_SECONDS == 15.0
+    assert OPENAI_WRITE_CODE_TIMEOUT_SECONDS < DEFAULT_RUN_DEADLINE_SECONDS
+    message = user_facing_openai_timeout_message("write_code", 120.0)
+    assert "Code generation" in message
+    assert "120" in message
+    assert "OpenAIWorkerError" not in message
+
+
+def test_call_openai_json_uses_code_artifact_timeout(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            return SimpleNamespace(output_text='{"code": "analysis_output = {}"}', output=[])
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+            self.responses = FakeResponses()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+
+    call_openai_json(
+        schema_name="code_artifact",
+        schema={"type": "object"},
+        instructions="return json",
+        input_payload={"q": "hi"},
+        api_key="test-key",
+    )
+
+    timeout = captured["timeout"]
+    read_timeout = getattr(timeout, "read", timeout)
+    assert float(read_timeout) == OPENAI_WRITE_CODE_TIMEOUT_SECONDS
+
+
+def test_code_generation_timeout_retries_once_then_succeeds(tmp_path, monkeypatch) -> None:
+    class TimeoutOnce(MockWorker):
+        def __init__(self) -> None:
+            self.write_calls = 0
+
+        def write_code(self, plan, data, chart_brief=None):
+            self.write_calls += 1
+            if self.write_calls == 1:
+                raise OpenAIWorkerTimeoutError(
+                    "write_code",
+                    OPENAI_WRITE_CODE_TIMEOUT_SECONDS,
+                    schema_name="code_artifact",
+                )
+            return super().write_code(plan, data, chart_brief=chart_brief)
+
+    monkeypatch.setattr(orchestrator_module, "fred_search", _search_cpi_and_gdp)
+    monkeypatch.setattr(orchestrator_module, "fred_fetch", _fetch_cpi_and_gdp)
+
+    worker = TimeoutOnce()
+    final_state = Orchestrator(
+        RunState(
+            run_id="timeout-retry",
+            question=ISAAC_QUESTION,
+            current_stage=Stage.INPUT,
+            retry_count=0,
+        ),
+        runs_dir=tmp_path,
+        worker=worker,
+        checker=MockChecker(),
+        fred_api_key="judge-key",
+        deadline_seconds=None,
+    ).run()
+
+    assert final_state.current_stage is Stage.RELEASED
+    assert worker.write_calls == 2
+    timeout_alarms = [alarm for alarm in final_state.alarms if alarm.type == "stage_timeout"]
+    assert len(timeout_alarms) == 1
+    assert timeout_alarms[0].recommended_action == "retry"
+    assert timeout_alarms[0].retry_from == "code_generation"
+    assert "OpenAIWorkerError" not in timeout_alarms[0].message
+    assert "did not match" not in timeout_alarms[0].message
+    assert "Code generation" in timeout_alarms[0].message
+
+
+def test_code_generation_timeout_escalates_after_one_retry(tmp_path, monkeypatch) -> None:
+    class AlwaysTimeout(MockWorker):
+        def __init__(self) -> None:
+            self.write_calls = 0
+
+        def write_code(self, plan, data, chart_brief=None):
+            self.write_calls += 1
+            raise OpenAIWorkerTimeoutError(
+                "write_code",
+                OPENAI_WRITE_CODE_TIMEOUT_SECONDS,
+                schema_name="code_artifact",
+            )
+
+    monkeypatch.setattr(orchestrator_module, "fred_search", _search_cpi_and_gdp)
+    monkeypatch.setattr(orchestrator_module, "fred_fetch", _fetch_cpi_and_gdp)
+
+    worker = AlwaysTimeout()
+    final_state = Orchestrator(
+        RunState(
+            run_id="timeout-escalate",
+            question=ISAAC_QUESTION,
+            current_stage=Stage.INPUT,
+            retry_count=0,
+        ),
+        runs_dir=tmp_path,
+        worker=worker,
+        checker=MockChecker(),
+        fred_api_key="judge-key",
+        deadline_seconds=None,
+    ).run()
+
+    assert final_state.current_stage is Stage.ESCALATED
+    assert worker.write_calls == 2
+    timeout_alarms = [alarm for alarm in final_state.alarms if alarm.type == "stage_timeout"]
+    assert len(timeout_alarms) == 2
+    assert timeout_alarms[0].recommended_action == "retry"
+    assert timeout_alarms[1].recommended_action == "escalate"
+    assert all("OpenAIWorkerError" not in alarm.message for alarm in timeout_alarms)
+    assert all("Code generation" in alarm.message for alarm in timeout_alarms)
+
+
+def test_timeout_retry_requires_remaining_run_budget(tmp_path) -> None:
+    state = RunState(
+        run_id="timeout-budget",
+        question=ISAAC_QUESTION,
+        current_stage=Stage.CODE_GENERATION,
+        retry_count=0,
+    )
+    orchestrator = Orchestrator(
+        state,
+        runs_dir=tmp_path,
+        deadline_seconds=DEFAULT_RUN_DEADLINE_SECONDS,
+    )
+    orchestrator._deadline_at = time.monotonic() + 5.0
+    assert orchestrator._should_retry_openai_timeout("code_generation") is False
+
+    unlimited = Orchestrator(
+        RunState(
+            run_id="timeout-unlimited",
+            question=ISAAC_QUESTION,
+            current_stage=Stage.CODE_GENERATION,
+            retry_count=0,
+        ),
+        runs_dir=tmp_path,
+        deadline_seconds=None,
+    )
+    assert unlimited._should_retry_openai_timeout("code_generation") is True
+    unlimited._timeout_retries["code_generation"] = 1
+    assert unlimited._should_retry_openai_timeout("code_generation") is False
 
 
 def test_ctrl_c_persists_escalation_instead_of_swallowing_interrupt(tmp_path) -> None:

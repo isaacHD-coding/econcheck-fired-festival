@@ -14,12 +14,31 @@ from workers.artifacts import (
     DraftArtifact,
     PlannerArtifact,
 )
-from workers.openai_client import DEFAULT_OPENAI_MODEL, OpenAIClientError, call_openai_json
+from workers.openai_client import (
+    DEFAULT_OPENAI_MODEL,
+    OpenAIClientError,
+    OpenAITimeoutError,
+    call_openai_json,
+    openai_timeout_seconds,
+    user_facing_openai_timeout_message,
+)
 from workers.openai_worker import HARNESS_BOUNDARY_RULES, STRING_ARRAY
 
 
 class OpenAICheckerError(RuntimeError):
     """Raised when the model-backed checker returns an unusable artifact."""
+
+
+class OpenAICheckerTimeoutError(OpenAICheckerError):
+    """Raised when the OpenAI checker hits its hard timeout."""
+
+    def __init__(self, timeout_seconds: float, *, schema_name: str = "checker_artifact") -> None:
+        self.stage_label = "review"
+        self.timeout_seconds = float(timeout_seconds)
+        self.schema_name = schema_name
+        super().__init__(
+            user_facing_openai_timeout_message(self.stage_label, self.timeout_seconds)
+        )
 
 
 class OpenAIChecker:
@@ -31,6 +50,13 @@ class OpenAIChecker:
     ) -> None:
         self.api_key = api_key
         self.model = model or DEFAULT_OPENAI_MODEL
+        self._call_timeout_cap_seconds: float | None = None
+
+    def set_call_timeout_cap(self, seconds: float | None) -> None:
+        if seconds is None:
+            self._call_timeout_cap_seconds = None
+            return
+        self._call_timeout_cap_seconds = max(0.1, float(seconds))
 
     def review(
         self,
@@ -47,6 +73,11 @@ class OpenAIChecker:
             "analysis": analysis.to_dict(),
             "draft": draft.to_dict(),
         }
+        timeout_seconds = openai_timeout_seconds(
+            schema_name="checker_artifact",
+            stage_label="review",
+            cap_seconds=self._call_timeout_cap_seconds,
+        )
         try:
             data = call_openai_json(
                 schema_name="checker_artifact",
@@ -55,8 +86,15 @@ class OpenAIChecker:
                 input_payload=payload,
                 api_key=self.api_key,
                 model=self.model,
+                timeout_seconds=timeout_seconds,
+                stage_label="review",
             )
             artifact = CheckerArtifact.from_dict(data)
+        except OpenAITimeoutError as exc:
+            raise OpenAICheckerTimeoutError(
+                exc.timeout_seconds,
+                schema_name="checker_artifact",
+            ) from exc
         except (ArtifactValidationError, OpenAIClientError, TypeError, ValueError) as exc:
             raise OpenAICheckerError(
                 f"OpenAI checker response did not match CheckerArtifact: {exc}"

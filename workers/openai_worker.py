@@ -31,11 +31,36 @@ from workers.artifacts import (
     PlannerArtifact,
 )
 from workers.chart_briefs import CHART_DESIGN_ADVICE, build_chart_brief, repair_chart_brief
-from workers.openai_client import DEFAULT_OPENAI_MODEL, OpenAIClientError, call_openai_json
+from workers.openai_client import (
+    DEFAULT_OPENAI_MODEL,
+    OpenAIClientError,
+    OpenAITimeoutError,
+    call_openai_json,
+    openai_timeout_seconds,
+    user_facing_openai_timeout_message,
+)
 
 
 class OpenAIWorkerError(RuntimeError):
     """Raised when a model artifact cannot be accepted by the harness."""
+
+
+class OpenAIWorkerTimeoutError(OpenAIWorkerError):
+    """Raised when an OpenAI worker stage hits its hard timeout."""
+
+    def __init__(
+        self,
+        stage_label: str,
+        timeout_seconds: float,
+        *,
+        schema_name: str = "",
+    ) -> None:
+        self.stage_label = stage_label
+        self.timeout_seconds = float(timeout_seconds)
+        self.schema_name = schema_name
+        super().__init__(
+            user_facing_openai_timeout_message(stage_label or schema_name, self.timeout_seconds)
+        )
 
 
 ArtifactT = TypeVar(
@@ -58,6 +83,15 @@ class OpenAIWorker:
         self.api_key = api_key
         self.model = model or DEFAULT_OPENAI_MODEL
         self.question = ""
+        self._call_timeout_cap_seconds: float | None = None
+
+    def set_call_timeout_cap(self, seconds: float | None) -> None:
+        """Cap the next OpenAI call so it cannot outlive remaining run budget."""
+
+        if seconds is None:
+            self._call_timeout_cap_seconds = None
+            return
+        self._call_timeout_cap_seconds = max(0.1, float(seconds))
 
     def plan(self, question: str, state: RunState) -> PlannerArtifact:
         self.question = question
@@ -69,10 +103,12 @@ class OpenAIWorker:
             "If the question asks about a relationship, correlation, anti-correlation, "
             "or more than one concept (for example inflation and real GDP), plan "
             "separate FRED search queries for each concept. Do not collapse that "
-            "question into a CPI-only five-year trend. The canonical CPI demo "
-            "question may prefer a query that can find CPIAUCSL. Charting is a later "
-            "worker step: the plan should name the claim a chart must support, not "
-            "dump every fetched series onto one axis."
+            "question into a CPI-only five-year trend. If it compares last year's and "
+            "this year's GDP growth, plan one GDP series (GDPC1) and year-over-year "
+            "growth versus its one-year lag—do not invent a second series. The "
+            "canonical CPI demo question may prefer a query that can find CPIAUCSL. "
+            "Charting is a later worker step: the plan should name the claim a chart "
+            "must support, not dump every fetched series onto one axis."
         )
         return self._call_artifact(
             schema_name="planner_artifact",
@@ -198,7 +234,10 @@ class OpenAIWorker:
                     "read or write files. Use only the Python standard library. "
                     "If input_data contains more than one series, analyze the "
                     "relationship among those series (aligned growth-rate correlation "
-                    "is acceptable) instead of a CPI-only five-year trend. "
+                    "is acceptable) instead of a CPI-only five-year trend. If the "
+                    "question is last year's vs this year's GDP growth and only one "
+                    "GDP series is present, correlate year-over-year growth with a "
+                    "one-year lag of the same series. "
                     + CHART_DESIGN_ADVICE
                     + " Follow chart_brief for layout and transforms. User-facing "
                     "chart titles, legends, and notes must be plain English "
@@ -277,6 +316,11 @@ class OpenAIWorker:
         artifact_cls: type[ArtifactT],
         stage_label: str,
     ) -> ArtifactT:
+        timeout_seconds = openai_timeout_seconds(
+            schema_name=schema_name,
+            stage_label=stage_label,
+            cap_seconds=self._call_timeout_cap_seconds,
+        )
         try:
             data = call_openai_json(
                 schema_name=schema_name,
@@ -285,8 +329,16 @@ class OpenAIWorker:
                 input_payload=input_payload,
                 api_key=self.api_key,
                 model=self.model,
+                timeout_seconds=timeout_seconds,
+                stage_label=stage_label,
             )
             return artifact_cls.from_dict(data)
+        except OpenAITimeoutError as exc:
+            raise OpenAIWorkerTimeoutError(
+                stage_label,
+                exc.timeout_seconds,
+                schema_name=schema_name,
+            ) from exc
         except (ArtifactValidationError, OpenAIClientError, TypeError, ValueError) as exc:
             raise OpenAIWorkerError(
                 f"OpenAI {stage_label} response did not match {artifact_cls.__name__}: {exc}"

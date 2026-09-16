@@ -103,7 +103,7 @@ Live tests **skip** when the matching API key is unset. They do not fail the sui
 - Planning guardrails: planner schema and approved tools
 - Data, code, and answer checkpoints, including provenance (no invented series)
 - Alarm routing with retry from `planning`, `data_discovery`, `code_generation`, or `draft_answer`, then escalation after `max_turns`
-- OpenAI worker calls use a **30s hard timeout on a daemon thread** and **no SDK retries**. A whole run also has a 3-minute wall-clock deadline and a stage-loop cap so the UI cannot spin forever. Ctrl+C should stop promptly instead of sitting on Streamlit “Stopping…” while HTTP finishes.
+- OpenAI worker calls use **stage-specific hard timeouts on a daemon thread** and **no SDK retries** (see table below). A whole run also has a 3-minute wall-clock deadline and a stage-loop cap so the UI cannot spin forever. A stage timeout retries that stage **once** if at least 15 seconds remain in the run budget, then escalates. Ctrl+C should stop promptly instead of sitting on Streamlit “Stopping…” while HTTP finishes.
 - Subprocess-backed analysis sandbox
 - Streamlit chat + observability for real runs under `runs/`
 - Mock worker for a reproducible CPI demo, unemployment-style single-series questions, and inflation-vs-real-GDP correlation when FRED search returns both `CPIAUCSL` and `GDPC1`
@@ -114,7 +114,18 @@ Live tests **skip** when the matching API key is unset. They do not fail the sui
 
 - The mock worker is a small deterministic specialist, not a general economist. It plans the canonical CPI demo onto `CPIAUCSL`, inflation-vs-real-GDP questions onto `CPIAUCSL`+`GDPC1` when those IDs appear in search results, and otherwise uses live search hits. It never invents series IDs.
 - OpenAI mode keeps a canonical CPI analysis/draft fallback only for the exact demo CPI question when the fetched data is CPI-only. Questions about correlation, GDP, or multiple series do not get that canned CPI paragraph.
-- OpenAI calls are capped at 30 seconds each (SDK retries disabled, wait happens off the Streamlit script thread). A live OpenAI run should finish or escalate within about three minutes; if the model is slow you may see a `run_deadline_exceeded` or OpenAI timeout alarm instead of a hang. Ctrl+C persists a `run_interrupted` alarm and re-raises so “Stopping…” does not wait on a blocking HTTP call.
+- OpenAI calls use stage-specific hard timeouts (SDK retries disabled; wait happens off the Streamlit script thread). Constants live in `workers/openai_client.py` (`OPENAI_TIMEOUT_SECONDS_BY_STAGE` / `OPENAI_TIMEOUT_SECONDS_BY_SCHEMA`):
+
+  | Stage | Schema | Timeout |
+  | --- | --- | --- |
+  | plan | `planner_artifact` | 30s |
+  | select_data | `data_selection_artifact` | 30s |
+  | design_chart | `chart_brief_artifact` | 60s |
+  | write_code | `code_artifact` | 120s |
+  | draft_answer | `draft_artifact` | 30s |
+  | checker review | `checker_artifact` | 30s |
+
+  Each call is also capped by remaining run budget so a retry cannot wait past the 3-minute deadline. A live OpenAI run should finish or escalate within about three minutes. If codegen times out, you should see a `stage_timeout` alarm in plain language (not a raw `OpenAIWorkerError`) and one retry from `code_generation` when time remains; otherwise `run_deadline_exceeded` / escalation. Ctrl+C persists a `run_interrupted` alarm and re-raises so “Stopping…” does not wait on a blocking HTTP call.
 - Mixed-frequency relationship analysis aligns series by carrying higher-frequency values forward onto lower-frequency dates and reports contemporaneous growth-rate correlation, not a causal or full lead-lag model. The worker writes a chart brief first (claim, transforms, layout, units, series ids). The default relationship chart is the two growth-rate series (same percent scale); a dual-axis or stacked levels chart is included when native units differ by an order of magnitude. Observability shows `chart_brief.json` next to analysis artifacts.
 - Data is FRED-only. Forecasting, policy advice, and non-economic questions are rejected.
 - Replay/resume from an arbitrary checkpoint, MCP, and extra data providers are out of scope.
