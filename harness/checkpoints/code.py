@@ -6,8 +6,9 @@ from collections.abc import Mapping
 import math
 from typing import Any
 
+from harness.charts import would_dwarf_a_series, y_fields
 from harness.checkpoints.base import CheckpointResult
-from workers.artifacts import AnalysisArtifact, ArtifactValidationError
+from workers.artifacts import AnalysisArtifact, ArtifactValidationError, ChartBriefArtifact
 
 
 class CodeExecutionCheckpoint:
@@ -94,6 +95,107 @@ class ChartPromiseCheckpoint:
         return CheckpointResult.pass_result("Analysis includes chart descriptor data.")
 
 
+class ChartHonestyCheckpoint:
+    """Reject shared-axis overlays that would dwarf a series."""
+
+    def evaluate(self, analysis: Any) -> CheckpointResult:
+        charts = _read_field(analysis, "charts", [])
+        if not isinstance(charts, list):
+            charts = []
+        dwarfing = [
+            index
+            for index, chart in enumerate(charts)
+            if isinstance(chart, dict) and would_dwarf_a_series(chart)
+        ]
+        if dwarfing:
+            return CheckpointResult.fail_result(
+                checkpoint_name=self.__class__.__name__,
+                stage="code_generation",
+                message=(
+                    "Chart places incompatible scales on one shared axis in a way "
+                    "that would dwarf a series."
+                ),
+                retry_from="code_generation",
+                context={"dwarfing_chart_indexes": dwarfing},
+            )
+        return CheckpointResult.pass_result("Charts do not dwarf a series on a shared axis.")
+
+
+class ChartLabelCheckpoint:
+    """Require units and series ids on multi-series charts."""
+
+    def evaluate(self, analysis: Any) -> CheckpointResult:
+        charts = _read_field(analysis, "charts", [])
+        if not isinstance(charts, list):
+            charts = []
+        unlabeled = []
+        for index, chart in enumerate(charts):
+            if not isinstance(chart, dict) or not _is_multi_series_chart(chart):
+                continue
+            missing: list[str] = []
+            if not _chart_has_units(chart):
+                missing.append("units")
+            if not _chart_cites_series_ids(chart):
+                missing.append("series_ids")
+            if missing:
+                unlabeled.append({"index": index, "missing": missing})
+        if unlabeled:
+            return CheckpointResult.fail_result(
+                checkpoint_name=self.__class__.__name__,
+                stage="code_generation",
+                message="Multi-series charts must label units and cite FRED series ids.",
+                retry_from="code_generation",
+                context={"unlabeled_charts": unlabeled},
+            )
+        return CheckpointResult.pass_result("Multi-series charts label units and series ids.")
+
+
+class ChartBriefCheckpoint:
+    """Require a validated chart brief, especially for multi-series paths."""
+
+    def evaluate(
+        self,
+        chart_brief: Any,
+        data: Any = None,
+        *,
+        question: str = "",
+    ) -> CheckpointResult:
+        try:
+            brief = _as_chart_brief(chart_brief)
+        except (ArtifactValidationError, AttributeError, TypeError, ValueError) as exc:
+            return CheckpointResult.fail_result(
+                checkpoint_name=self.__class__.__name__,
+                stage="code_generation",
+                message=f"Chart brief is missing or invalid: {exc}",
+                retry_from="code_generation",
+                context={"error": str(exc)},
+            )
+
+        fetched = _data_series_ids(data)
+        invented = [series_id for series_id in brief.series_ids if fetched and series_id not in fetched]
+        if invented:
+            return CheckpointResult.fail_result(
+                checkpoint_name=self.__class__.__name__,
+                stage="code_generation",
+                message="Chart brief cites FRED series that were not fetched.",
+                retry_from="code_generation",
+                context={"invented_series_ids": invented, "fetched_series_ids": fetched},
+            )
+        if len(fetched) >= 2 and len([item for item in brief.series_ids if item in fetched]) < 2:
+            return CheckpointResult.fail_result(
+                checkpoint_name=self.__class__.__name__,
+                stage="code_generation",
+                message="Multi-series analysis requires a chart brief covering the fetched series.",
+                retry_from="code_generation",
+                context={
+                    "brief_series_ids": list(brief.series_ids),
+                    "fetched_series_ids": fetched,
+                    "question": question,
+                },
+            )
+        return CheckpointResult.pass_result("Chart brief is present and validated.")
+
+
 def _read_field(item: Any, field_name: str, default: Any = None) -> Any:
     if isinstance(item, Mapping):
         return item.get(field_name, default)
@@ -117,3 +219,75 @@ def _analysis_mapping(analysis: Any) -> Mapping[str, Any]:
         "warnings",
     )
     return {field_name: getattr(analysis, field_name) for field_name in required_fields}
+
+
+def _is_multi_series_chart(chart: dict[str, Any]) -> bool:
+    if len(y_fields(chart)) >= 2:
+        return True
+    series_ids = _chart_series_ids(chart)
+    return len(series_ids) >= 2
+
+
+def _chart_has_units(chart: dict[str, Any]) -> bool:
+    for key in ("unit", "units", "y_label"):
+        if str(chart.get(key) or "").strip():
+            return True
+    left = str(chart.get("y_left_label") or "").strip()
+    right = str(chart.get("y_right_label") or "").strip()
+    return bool(left and right)
+
+
+def _chart_cites_series_ids(chart: dict[str, Any]) -> bool:
+    if _chart_series_ids(chart):
+        return True
+    blob = " ".join(
+        [
+            str(chart.get("title") or ""),
+            str(chart.get("notes") or ""),
+            " ".join(y_fields(chart)),
+        ]
+    )
+    return bool(_extract_series_tokens(blob))
+
+
+def _chart_series_ids(chart: dict[str, Any]) -> list[str]:
+    raw = chart.get("series_ids")
+    if isinstance(raw, list):
+        return [str(item) for item in raw if str(item).strip()]
+    series_id = chart.get("series_id")
+    if isinstance(series_id, list):
+        return [str(item) for item in series_id if str(item).strip()]
+    if isinstance(series_id, str) and series_id.strip():
+        return [part.strip() for part in series_id.split(",") if part.strip()]
+    return []
+
+
+def _extract_series_tokens(blob: str) -> list[str]:
+    tokens = []
+    for token in blob.replace(",", " ").split():
+        cleaned = token.strip("()[]")
+        if cleaned.isupper() and any(char.isdigit() for char in cleaned) and len(cleaned) >= 4:
+            tokens.append(cleaned)
+    return tokens
+
+
+def _as_chart_brief(chart_brief: Any) -> ChartBriefArtifact:
+    if isinstance(chart_brief, ChartBriefArtifact):
+        return ChartBriefArtifact.from_dict(chart_brief.to_dict())
+    if hasattr(chart_brief, "to_dict"):
+        return ChartBriefArtifact.from_dict(chart_brief.to_dict())
+    if isinstance(chart_brief, Mapping):
+        return ChartBriefArtifact.from_dict(chart_brief)
+    raise ArtifactValidationError("chart_brief is required")
+
+
+def _data_series_ids(data: Any) -> list[str]:
+    if data is None:
+        return []
+    series_ids = _read_field(data, "series_ids", [])
+    if isinstance(series_ids, list) and series_ids:
+        return [str(item) for item in series_ids]
+    observations = _read_field(data, "observations", {})
+    if isinstance(observations, dict):
+        return [str(item) for item in observations]
+    return []

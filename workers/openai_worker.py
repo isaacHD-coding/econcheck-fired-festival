@@ -21,12 +21,14 @@ from workers.analysis_templates import (
 from workers.artifacts import (
     AnalysisArtifact,
     ArtifactValidationError,
+    ChartBriefArtifact,
     CodeArtifact,
     DataArtifact,
     DataSelectionArtifact,
     DraftArtifact,
     PlannerArtifact,
 )
+from workers.chart_briefs import CHART_DESIGN_ADVICE, build_chart_brief, repair_chart_brief
 from workers.openai_client import DEFAULT_OPENAI_MODEL, OpenAIClientError, call_openai_json
 
 
@@ -38,6 +40,7 @@ ArtifactT = TypeVar(
     "ArtifactT",
     PlannerArtifact,
     DataSelectionArtifact,
+    ChartBriefArtifact,
     CodeArtifact,
     DraftArtifact,
 )
@@ -65,7 +68,9 @@ class OpenAIWorker:
             "or more than one concept (for example inflation and real GDP), plan "
             "separate FRED search queries for each concept. Do not collapse that "
             "question into a CPI-only five-year trend. The canonical CPI demo "
-            "question may prefer a query that can find CPIAUCSL."
+            "question may prefer a query that can find CPIAUCSL. Charting is a later "
+            "worker step: the plan should name the claim a chart must support, not "
+            "dump every fetched series onto one axis."
         )
         return self._call_artifact(
             schema_name="planner_artifact",
@@ -124,14 +129,55 @@ class OpenAIWorker:
                     return canonical_selection
         return selection
 
+    def design_chart(
+        self,
+        plan: PlannerArtifact,
+        data_summary: DataArtifact,
+    ) -> ChartBriefArtifact:
+        fallback = build_chart_brief(plan, data_summary, question=self.question)
+        payload = {
+            "plan": plan.to_dict(),
+            "data": data_summary.to_dict(),
+            "fallback_brief": fallback.to_dict(),
+        }
+        try:
+            brief = self._call_artifact(
+                schema_name="chart_brief_artifact",
+                schema=CHART_BRIEF_SCHEMA,
+                instructions=_stage_instructions(
+                    "Chart design",
+                    "Produce a structured chart brief that analysis codegen must follow.",
+                    (
+                        CHART_DESIGN_ADVICE
+                        + " Use only series_ids present in the supplied DataArtifact. "
+                        "Do not invent FRED ids. Canonical CPI-only demos may keep a "
+                        "simple single line chart. For inflation vs real GDP correlation, "
+                        "prefer period-over-period growth on a shared percent axis, with "
+                        "dual-axis or stacked levels only as a companion when native "
+                        "units would dwarf a series."
+                    ),
+                ),
+                input_payload=payload,
+                artifact_cls=ChartBriefArtifact,
+                stage_label="design_chart",
+            )
+        except OpenAIWorkerError:
+            return fallback
+        return repair_chart_brief(brief, plan, data_summary, question=self.question)
+
     def write_code(
         self,
         plan: PlannerArtifact,
         data_summary: DataArtifact,
+        chart_brief: ChartBriefArtifact | None = None,
     ) -> CodeArtifact:
+        brief = chart_brief or build_chart_brief(plan, data_summary, question=self.question)
+        if hasattr(data_summary, "metadata") and isinstance(data_summary.metadata, dict):
+            data_summary.metadata["chart_brief"] = brief.to_dict()
         payload = {
             "plan": plan.to_dict(),
             "data": data_summary.to_dict(),
+            "chart_brief": brief.to_dict(),
         }
         code_artifact = self._call_artifact(
             schema_name="code_artifact",
@@ -151,12 +197,12 @@ class OpenAIWorker:
                     "If input_data contains more than one series, analyze the "
                     "relationship among those series (aligned growth-rate correlation "
                     "is acceptable) instead of a CPI-only five-year trend. "
-                    "Chart design: never overlay raw series with incompatible scales "
-                    "(for example CPI index vs GDP in billions) on one shared y-axis. "
-                    "For correlation / growth questions, plot period-over-period percent "
-                    "growth for both series on one percent axis. For mixed-unit levels, "
-                    "set layout to dual_axis with y_left and y_right (or stacked panels). "
-                    "Set shared_y_axis to false whenever two series would dwarf each other."
+                    + CHART_DESIGN_ADVICE
+                    + " Follow chart_brief exactly: claim, series_ids, transforms, "
+                    "layout (single|dual_axis|stacked), y_starts_at_zero, title, "
+                    "axis labels/units, notes, and chart_type. Every multi-series "
+                    "chart must label units and cite FRED series ids. Never overlay "
+                    "raw series with incompatible scales on one shared y-axis."
                 ),
             ),
             input_payload=payload,
@@ -504,9 +550,9 @@ def _plan_blob(plan: PlannerArtifact) -> str:
 
 HARNESS_BOUNDARY_RULES = (
     "Harness boundary rules: you are the worker only. You may plan, select data, "
-    "write code, and draft answers. You may not call FRED, fetch data, execute code, "
-    "route retries, escalate failures, or release answers. The harness owns tools, "
-    "execution, checkpoints, alarms, persistence, observability, and release."
+    "design charts, write code, and draft answers. You may not call FRED, fetch data, "
+    "execute code, route retries, escalate failures, or release answers. The harness "
+    "owns tools, execution, checkpoints, alarms, persistence, observability, and release."
 )
 
 
@@ -576,6 +622,45 @@ CODE_SCHEMA: dict[str, Any] = {
         "code": {"type": "string"},
     },
     "required": ["code"],
+}
+
+CHART_BRIEF_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "claim": {"type": "string"},
+        "series_ids": STRING_ARRAY,
+        "transforms": STRING_ARRAY,
+        "layout": {"type": "string"},
+        "y_starts_at_zero": {"type": "boolean"},
+        "time_window_rationale": {"type": "string"},
+        "annotations": STRING_ARRAY,
+        "title": {"type": "string"},
+        "x_label": {"type": "string"},
+        "y_label": {"type": "string"},
+        "units": {"type": "string"},
+        "notes": {"type": "string"},
+        "chart_type": {"type": "string"},
+        "y_left_label": {"type": "string"},
+        "y_right_label": {"type": "string"},
+    },
+    "required": [
+        "claim",
+        "series_ids",
+        "transforms",
+        "layout",
+        "y_starts_at_zero",
+        "time_window_rationale",
+        "annotations",
+        "title",
+        "x_label",
+        "y_label",
+        "units",
+        "notes",
+        "chart_type",
+        "y_left_label",
+        "y_right_label",
+    ],
 }
 
 DRAFT_SCHEMA: dict[str, Any] = {

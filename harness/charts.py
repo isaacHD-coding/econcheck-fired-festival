@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from workers.artifacts import AnalysisArtifact
+from workers.artifacts import AnalysisArtifact, ChartBriefArtifact
 
 
 SCALE_RATIO_THRESHOLD = 10.0
@@ -61,8 +61,8 @@ def uses_comparable_units(chart: dict[str, Any]) -> bool:
 
 
 def shares_single_axis(chart: dict[str, Any]) -> bool:
-    layout = str(chart.get("layout") or "single").lower()
-    if layout in {"dual_axis", "dual-axis", "stacked"}:
+    layout = _layout_name(chart)
+    if layout in {"dual_axis", "stacked", "panels"}:
         return False
     if chart.get("shared_y_axis") is False:
         return False
@@ -73,10 +73,13 @@ def would_dwarf_a_series(chart: dict[str, Any]) -> bool:
     return shares_single_axis(chart) and scales_incompatible(chart) and not uses_comparable_units(chart)
 
 
-def normalize_chart(chart: dict[str, Any]) -> dict[str, Any]:
-    """Rewrite mixed-scale single-axis overlays into a dual-axis descriptor."""
+def normalize_chart(
+    chart: dict[str, Any],
+    brief: ChartBriefArtifact | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Rewrite mixed-scale single-axis overlays into a dual-axis or stacked descriptor."""
 
-    normalized = dict(chart)
+    normalized = apply_chart_brief(chart, brief)
     fields = y_fields(normalized)
     if len(fields) < 2:
         normalized.setdefault("layout", "single")
@@ -89,7 +92,8 @@ def normalize_chart(chart: dict[str, Any]) -> dict[str, Any]:
         normalized["y_field"] = fields
         return normalized
 
-    normalized["layout"] = "dual_axis"
+    layout = _rewrite_layout(normalized, brief)
+    normalized["layout"] = layout
     normalized["shared_y_axis"] = False
     normalized["y_field"] = fields
     normalized["y_left"] = normalized.get("y_left") or fields[0]
@@ -101,9 +105,46 @@ def normalize_chart(chart: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def normalize_analysis_charts(analysis: AnalysisArtifact) -> AnalysisArtifact:
+def apply_chart_brief(
+    chart: dict[str, Any],
+    brief: ChartBriefArtifact | dict[str, Any] | None,
+) -> dict[str, Any]:
+    payload = _brief_payload(brief)
+    normalized = dict(chart)
+    if not payload:
+        return normalized
+    if not normalized.get("title") and payload.get("title"):
+        normalized["title"] = payload["title"]
+    if not normalized.get("type") and payload.get("chart_type"):
+        normalized["type"] = payload["chart_type"]
+    if "y_starts_at_zero" not in normalized and "y_starts_at_zero" in payload:
+        normalized["y_starts_at_zero"] = bool(payload["y_starts_at_zero"])
+    if payload.get("notes") and not normalized.get("notes"):
+        normalized["notes"] = payload["notes"]
+    if payload.get("series_ids") and not normalized.get("series_id") and not normalized.get("series_ids"):
+        series_ids = [str(item) for item in payload["series_ids"] if item]
+        normalized["series_ids"] = series_ids
+        normalized["series_id"] = ",".join(series_ids)
+    if _chart_matches_brief_transform(normalized, payload):
+        if not normalized.get("layout") and payload.get("layout"):
+            normalized["layout"] = payload["layout"]
+        if not normalized.get("unit") and not normalized.get("units") and payload.get("units"):
+            normalized["unit"] = payload["units"]
+        if not normalized.get("y_label") and payload.get("y_label"):
+            normalized["y_label"] = payload["y_label"]
+        if payload.get("y_left_label") and not normalized.get("y_left_label"):
+            normalized["y_left_label"] = payload["y_left_label"]
+        if payload.get("y_right_label") and not normalized.get("y_right_label"):
+            normalized["y_right_label"] = payload["y_right_label"]
+    return normalized
+
+
+def normalize_analysis_charts(
+    analysis: AnalysisArtifact,
+    brief: ChartBriefArtifact | dict[str, Any] | None = None,
+) -> AnalysisArtifact:
     analysis.charts = [
-        normalize_chart(chart) if isinstance(chart, dict) else chart
+        normalize_chart(chart, brief) if isinstance(chart, dict) else chart
         for chart in analysis.charts
     ]
     return analysis
@@ -133,14 +174,14 @@ def _render_one_chart(st: Any, chart: dict[str, Any], *, index: int) -> None:
             st.json(chart)
         return
 
-    layout = str(chart.get("layout") or "single").lower().replace("-", "_")
+    layout = _layout_name(chart)
     x_field = str(chart.get("x_field") or chart.get("x") or "date")
     fields = y_fields(chart)
 
     if layout == "dual_axis" and len(fields) >= 2:
         if not _render_dual_axis(st, chart, data, x_field, fields):
             _render_stacked(st, chart, data, x_field, fields)
-    elif layout == "stacked" and len(fields) >= 2:
+    elif layout in {"stacked", "panels"} and len(fields) >= 2:
         _render_stacked(st, chart, data, x_field, fields)
     else:
         y = fields if len(fields) > 1 else fields[0]
@@ -182,13 +223,14 @@ def _render_dual_axis(
     right = str(chart.get("y_right") or fields[1])
     left_title = str(chart.get("y_left_label") or left)
     right_title = str(chart.get("y_right_label") or right)
-    base = alt.Chart(data).encode(x=alt.X(x_field, title=x_field))
+    zero = bool(chart.get("y_starts_at_zero"))
+    base = alt.Chart(data).encode(x=alt.X(x_field, title=str(chart.get("x_label") or x_field)))
     left_layer = base.mark_line(color="#4C78A8").encode(
-        y=alt.Y(left, axis=alt.Axis(title=left_title, titleColor="#4C78A8")),
+        y=alt.Y(left, axis=alt.Axis(title=left_title, titleColor="#4C78A8"), scale=alt.Scale(zero=zero)),
         tooltip=[x_field, left, right],
     )
     right_layer = base.mark_line(color="#F58518").encode(
-        y=alt.Y(right, axis=alt.Axis(title=right_title, titleColor="#F58518")),
+        y=alt.Y(right, axis=alt.Axis(title=right_title, titleColor="#F58518"), scale=alt.Scale(zero=zero)),
         tooltip=[x_field, left, right],
     )
     layered = alt.layer(left_layer, right_layer).resolve_scale(y="independent")
@@ -196,4 +238,46 @@ def _render_dual_axis(
         st.altair_chart(layered, width="stretch")
     except TypeError:
         st.altair_chart(layered)
+    return True
+
+
+def _layout_name(chart: dict[str, Any]) -> str:
+    return str(chart.get("layout") or "single").lower().replace("-", "_").replace(" ", "_")
+
+
+def _rewrite_layout(
+    chart: dict[str, Any],
+    brief: ChartBriefArtifact | dict[str, Any] | None,
+) -> str:
+    payload = _brief_payload(brief)
+    requested = str((payload or {}).get("layout") or chart.get("layout") or "dual_axis")
+    requested = requested.lower().replace("-", "_").replace(" ", "_")
+    if requested in {"stacked", "panels", "small_multiples"}:
+        return "stacked"
+    return "dual_axis"
+
+
+def _brief_payload(
+    brief: ChartBriefArtifact | dict[str, Any] | None,
+) -> dict[str, Any]:
+    if brief is None:
+        return {}
+    if isinstance(brief, ChartBriefArtifact):
+        return brief.to_dict()
+    if hasattr(brief, "to_dict"):
+        payload = brief.to_dict()
+        return dict(payload) if isinstance(payload, dict) else {}
+    if isinstance(brief, dict):
+        return dict(brief)
+    return {}
+
+
+def _chart_matches_brief_transform(chart: dict[str, Any], payload: dict[str, Any]) -> bool:
+    transforms = " ".join(str(item).lower() for item in (payload.get("transforms") or []))
+    fields = " ".join(y_fields(chart)).lower()
+    comparable = ("growth", "yoy", "qoq", "mom", "zscore", "percent", "index_to_100")
+    brief_wants_comparable = any(token in transforms for token in comparable)
+    fields_look_comparable = any(token in fields for token in comparable) or uses_comparable_units(chart)
+    if brief_wants_comparable:
+        return fields_look_comparable or not y_fields(chart)
     return True

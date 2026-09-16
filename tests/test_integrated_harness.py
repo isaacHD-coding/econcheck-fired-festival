@@ -188,6 +188,20 @@ def test_mocked_inflation_gdp_correlation_fetches_both_series_and_does_not_relea
     assert "materially higher" not in final_answer["answer"]
     assert "correlation" in final_answer["answer"].lower()
     assert "GDPC1" in final_answer["answer"]
+    brief = json.loads((tmp_path / "corr-test" / "chart_brief.json").read_text())
+    assert set(brief["series_ids"]) == {"CPIAUCSL", "GDPC1"}
+    assert brief["transforms"]
+    analysis = json.loads((tmp_path / "corr-test" / "analysis.json").read_text())
+    from harness.charts import would_dwarf_a_series
+
+    assert analysis["charts"]
+    for chart in analysis["charts"]:
+        assert would_dwarf_a_series(chart) is False
+        if isinstance(chart.get("y_field"), list) and len(chart["y_field"]) >= 2:
+            assert chart.get("unit") or chart.get("y_label") or (
+                chart.get("y_left_label") and chart.get("y_right_label")
+            )
+            assert chart.get("series_id") or chart.get("series_ids")
 
 
 def test_openai_mode_correlation_question_does_not_release_canned_cpi(

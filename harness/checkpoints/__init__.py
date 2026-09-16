@@ -6,6 +6,9 @@ from harness.checkpoints.answer import (
 )
 from harness.checkpoints.base import CheckpointResult
 from harness.checkpoints.code import (
+    ChartBriefCheckpoint,
+    ChartHonestyCheckpoint,
+    ChartLabelCheckpoint,
     ChartPromiseCheckpoint,
     CodeExecutionCheckpoint,
     MathSanityCheckpoint,
@@ -31,6 +34,9 @@ CODE_CHECKPOINTS = (
     OutputShapeCheckpoint(),
     MathSanityCheckpoint(),
     ChartPromiseCheckpoint(),
+    ChartHonestyCheckpoint(),
+    ChartLabelCheckpoint(),
+    ChartBriefCheckpoint(),
 )
 
 ANSWER_CHECKPOINTS = (
@@ -50,6 +56,9 @@ __all__ = [
     "CHECKPOINT_REGISTRY",
     "CODE_CHECKPOINTS",
     "AnswerGroundingCheckpoint",
+    "ChartBriefCheckpoint",
+    "ChartHonestyCheckpoint",
+    "ChartLabelCheckpoint",
     "ChartPromiseCheckpoint",
     "CheckpointResult",
     "CodeExecutionCheckpoint",

@@ -108,14 +108,14 @@ Live tests **skip** when the matching API key is unset. They do not fail the sui
 - Streamlit chat + observability for real runs under `runs/`
 - Mock worker for a reproducible CPI demo, unemployment-style single-series questions, and inflation-vs-real-GDP correlation when FRED search returns both `CPIAUCSL` and `GDPC1`
 - Optional OpenAI worker/checker behind the same protocol. Canonical CPI analysis/draft fallback is limited to the exact demo CPI question with CPI-only data; multi-series plans keep their relationship analysis.
-- Mixed-scale charts: correlation/growth questions plot period-over-period percent growth on a shared percent axis; incompatible raw levels (CPI index vs GDP in billions) use dual y-axes instead of one crushed overlay.
+- Mixed-scale charts: workers emit a structured **chart brief** (`chart_brief.json`) before analysis codegen. Correlation/growth questions plot period-over-period percent growth on a shared percent axis; incompatible raw levels (CPI index vs GDP in billions) use dual y-axes or stacked panels. Harness checkpoints reject dwarf shared-axis overlays and require units plus FRED series ids on multi-series charts.
 
 ## Remaining limitations
 
 - The mock worker is a small deterministic specialist, not a general economist. It plans the canonical CPI demo onto `CPIAUCSL`, inflation-vs-real-GDP questions onto `CPIAUCSL`+`GDPC1` when those IDs appear in search results, and otherwise uses live search hits. It never invents series IDs.
 - OpenAI mode keeps a canonical CPI analysis/draft fallback only for the exact demo CPI question when the fetched data is CPI-only. Questions about correlation, GDP, or multiple series do not get that canned CPI paragraph.
 - OpenAI calls are capped at 30 seconds each (SDK retries disabled, wait happens off the Streamlit script thread). A live OpenAI run should finish or escalate within about three minutes; if the model is slow you may see a `run_deadline_exceeded` or OpenAI timeout alarm instead of a hang. Ctrl+C persists a `run_interrupted` alarm and re-raises so “Stopping…” does not wait on a blocking HTTP call.
-- Mixed-frequency relationship analysis aligns series by carrying higher-frequency values forward onto lower-frequency dates and reports contemporaneous growth-rate correlation, not a causal or full lead-lag model. The default relationship chart is the two growth-rate series (same percent scale); a dual-axis levels chart is included when native units differ by an order of magnitude.
+- Mixed-frequency relationship analysis aligns series by carrying higher-frequency values forward onto lower-frequency dates and reports contemporaneous growth-rate correlation, not a causal or full lead-lag model. The worker writes a chart brief first (claim, transforms, layout, units, series ids). The default relationship chart is the two growth-rate series (same percent scale); a dual-axis or stacked levels chart is included when native units differ by an order of magnitude. Observability shows `chart_brief.json` next to analysis artifacts.
 - Data is FRED-only. Forecasting, policy advice, and non-economic questions are rejected.
 - Replay/resume from an arbitrary checkpoint, MCP, and extra data providers are out of scope.
 - There is no Vercel frontend; deploy the Streamlit app (Community Cloud, a VM, or any host that can run `streamlit run app.py`).
@@ -133,4 +133,5 @@ harness/tools/code_runner.py
 harness/config.py           Env / secrets resolution
 workers/mock_worker.py      Deterministic worker
 workers/openai_worker.py    Optional model-backed worker
+workers/chart_briefs.py     Adaptive chart-brief builder + design advice
 ```

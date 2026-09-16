@@ -9,12 +9,14 @@ from harness.state import RunState
 from workers.analysis_templates import relationship_analysis_code, relationship_draft
 from workers.artifacts import (
     AnalysisArtifact,
+    ChartBriefArtifact,
     CodeArtifact,
     DataArtifact,
     DataSelectionArtifact,
     DraftArtifact,
     PlannerArtifact,
 )
+from workers.chart_briefs import build_chart_brief
 
 
 class MockWorker:
@@ -147,16 +149,34 @@ class MockWorker:
             ),
         )
 
+    def design_chart(
+        self,
+        plan: PlannerArtifact,
+        data_summary: DataArtifact | dict[str, Any],
+    ) -> ChartBriefArtifact:
+        return build_chart_brief(
+            plan,
+            data_summary,
+            question=getattr(self, "question", ""),
+        )
+
     def write_code(
         self,
         plan: PlannerArtifact,
         data_summary: DataArtifact | dict[str, Any],
+        chart_brief: ChartBriefArtifact | None = None,
     ) -> CodeArtifact:
         series_ids = _series_ids(data_summary)
+        brief = chart_brief or build_chart_brief(
+            plan,
+            data_summary,
+            question=getattr(self, "question", ""),
+        )
+        _attach_chart_brief(data_summary, brief)
         if len(series_ids) > 1:
             return CodeArtifact(code=relationship_analysis_code())
         series_id = series_ids[0] if series_ids else "CPIAUCSL"
-        return CodeArtifact(code=_single_series_analysis_code(series_id))
+        return CodeArtifact(code=_single_series_analysis_code(series_id, brief))
 
     def draft_answer(
         self,
@@ -284,7 +304,24 @@ def _series_ids(data_summary: DataArtifact | dict[str, Any]) -> list[str]:
     return []
 
 
-def _single_series_analysis_code(series_id: str) -> str:
+def _attach_chart_brief(
+    data_summary: DataArtifact | dict[str, Any],
+    brief: ChartBriefArtifact,
+) -> None:
+    payload = brief.to_dict()
+    if hasattr(data_summary, "metadata") and isinstance(data_summary.metadata, dict):
+        data_summary.metadata["chart_brief"] = payload
+        return
+    if isinstance(data_summary, dict):
+        metadata = data_summary.setdefault("metadata", {})
+        if isinstance(metadata, dict):
+            metadata["chart_brief"] = payload
+
+
+def _single_series_analysis_code(
+    series_id: str,
+    chart_brief: ChartBriefArtifact | None = None,
+) -> str:
     cpi = series_id == "CPIAUCSL"
     five_year_name = "cpi_five_year_change_percent" if cpi else "five_year_change_percent"
     yoy_name = "latest_yoy_inflation_percent" if cpi else "latest_yoy_change_percent"
@@ -295,6 +332,21 @@ def _single_series_analysis_code(series_id: str) -> str:
         if cpi
         else f"{series_id} changed over the fetched window."
     )
+    title = f"{series_id} over the last five years"
+    y_label = level_unit
+    notes = f"Single-series levels chart of {series_id}."
+    chart_type = "line"
+    y_starts_at_zero = False
+    layout = "single"
+    if chart_brief is not None:
+        title = chart_brief.title.replace('"', "'")
+        y_label = chart_brief.y_label.replace('"', "'")
+        notes = chart_brief.notes.replace('"', "'")
+        chart_type = chart_brief.chart_type
+        y_starts_at_zero = chart_brief.y_starts_at_zero
+        layout = chart_brief.layout
+        if chart_brief.units:
+            level_unit = chart_brief.units.replace('"', "'")
     return f"""rows = sorted(
     input_data["observations"]["{series_id}"],
     key=lambda row: row["date"],
@@ -369,13 +421,18 @@ analysis_output = {{
     ],
     "charts": [
         {{
-            "type": "line",
-            "title": "{series_id} over the last five years",
+            "type": "{chart_type}",
+            "layout": "{layout}",
+            "shared_y_axis": True,
+            "title": "{title}",
             "x_field": "date",
             "y_field": "value",
             "unit": "{level_unit}",
+            "y_label": "{y_label}",
             "series_id": "{series_id}",
+            "y_starts_at_zero": {y_starts_at_zero},
             "data": chart_rows,
+            "notes": "{notes}",
         }}
     ],
     "method_notes": (

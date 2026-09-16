@@ -54,6 +54,7 @@ CORE_ARTIFACTS = [
     "fred_search.json",
     "selected_data.json",
     "data.json",
+    "chart_brief.json",
     "generated_code.py",
     "analysis.json",
     "checkpoint_results.json",

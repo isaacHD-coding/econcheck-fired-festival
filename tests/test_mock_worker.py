@@ -3,7 +3,9 @@ import unittest
 from harness.state import RunState, Stage
 from workers.artifacts import (
     AnalysisArtifact,
+    ChartBriefArtifact,
     CodeArtifact,
+    DataArtifact,
     DataSelectionArtifact,
     DraftArtifact,
     PlannerArtifact,
@@ -55,6 +57,22 @@ class MockWorkerTests(unittest.TestCase):
 
         self.assertIsInstance(artifact, CodeArtifact)
         self.assertEqual(CodeArtifact.from_dict(artifact.to_dict()), artifact)
+
+    def test_design_chart_returns_single_series_brief_for_cpi(self) -> None:
+        plan = self.worker.plan(self.state.question, self.state)
+        brief = self.worker.design_chart(
+            plan,
+            DataArtifact(
+                series_ids=["CPIAUCSL"],
+                observations={"CPIAUCSL": []},
+                metadata={"source": "FRED"},
+            ),
+        )
+
+        self.assertIsInstance(brief, ChartBriefArtifact)
+        self.assertEqual(brief.series_ids, ["CPIAUCSL"])
+        self.assertEqual(brief.layout, "single")
+        self.assertIn("levels", brief.transforms)
 
     def test_draft_answer_returns_valid_draft_artifact(self) -> None:
         plan = self.worker.plan(self.state.question, self.state)
@@ -120,6 +138,28 @@ class MockWorkerTests(unittest.TestCase):
             {"CPIAUCSL", "GDPC1"},
         )
         self.assertEqual(empty_selection.selected_series, [])
+
+    def test_relationship_design_chart_covers_fetched_series(self) -> None:
+        question = (
+            "What is the correlation (or anti correlation) between inflation "
+            "and real GDP growth?"
+        )
+        plan = self.worker.plan(question, self.state)
+        brief = self.worker.design_chart(
+            plan,
+            DataArtifact(
+                series_ids=["CPIAUCSL", "GDPC1"],
+                observations={"CPIAUCSL": [], "GDPC1": []},
+                metadata={"source": "FRED"},
+            ),
+        )
+
+        self.assertEqual(set(brief.series_ids), {"CPIAUCSL", "GDPC1"})
+        self.assertIn("growth", brief.transforms)
+        self.assertEqual(brief.layout, "single")
+        self.assertFalse(brief.y_starts_at_zero)
+        self.assertIn("CPIAUCSL", brief.title)
+        self.assertIn("GDPC1", brief.title)
 
 
 if __name__ == "__main__":

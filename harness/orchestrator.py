@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import inspect
 import time
 from typing import Any
 from pathlib import Path
@@ -10,6 +11,9 @@ from pathlib import Path
 from harness.alarms import Alarm
 from harness.checkpoints import (
     AnswerGroundingCheckpoint,
+    ChartBriefCheckpoint,
+    ChartHonestyCheckpoint,
+    ChartLabelCheckpoint,
     ChartPromiseCheckpoint,
     CodeExecutionCheckpoint,
     DataCompletenessCheckpoint,
@@ -27,6 +31,7 @@ from harness.tools.code_runner import run_analysis_code
 from harness.tools.fred import FredConfigurationError, FredToolError, fred_fetch, fred_search
 from workers.artifacts import (
     AnalysisArtifact,
+    ChartBriefArtifact,
     CheckerArtifact,
     CodeArtifact,
     DataArtifact,
@@ -34,6 +39,7 @@ from workers.artifacts import (
     DraftArtifact,
     PlannerArtifact,
 )
+from workers.chart_briefs import build_chart_brief
 
 
 TERMINAL_STAGES = {Stage.RELEASED, Stage.ESCALATED}
@@ -456,7 +462,12 @@ class Orchestrator:
             "Writing and executing analysis code.",
         )
 
-        code_artifact = self.worker.write_code(plan, data)
+        chart_brief = self._design_chart(plan, data)
+        data.metadata = dict(data.metadata or {})
+        data.metadata["chart_brief"] = chart_brief.to_dict()
+        self._save_json_artifact("data", data)
+
+        code_artifact = self._write_code(plan, data, chart_brief)
         code_artifact = CodeArtifact.from_dict(code_artifact.to_dict())
         self._save_text_artifact("generated_code", "generated_code.py", code_artifact.code)
 
@@ -471,10 +482,14 @@ class Orchestrator:
                 output_log_path=code_output_path,
             )
         except Exception as exc:
-            self._apply_checkpoint(CodeExecutionCheckpoint().evaluate({
-                "succeeded": False,
-                "execution_error": repr(exc),
-            }))
+            self._apply_checkpoint(
+                CodeExecutionCheckpoint().evaluate({
+                    "succeeded": False,
+                    "execution_error": repr(exc),
+                }),
+                name="CodeExecutionCheckpoint",
+                stage=Stage.CODE_GENERATION,
+            )
             self._fail_with_alarm(
                 type="code_execution_failed",
                 message="Generated analysis code failed.",
@@ -489,10 +504,11 @@ class Orchestrator:
         analysis = AnalysisArtifact.from_dict(analysis.to_dict())
         from harness.charts import normalize_analysis_charts
 
-        analysis = normalize_analysis_charts(analysis)
+        honesty = ChartHonestyCheckpoint().evaluate(analysis)
+        analysis = normalize_analysis_charts(analysis, chart_brief)
         self._save_json_artifact("analysis", analysis)
 
-        self._run_code_checks(analysis)
+        self._run_code_checks(analysis, chart_brief=chart_brief, honesty=honesty, data=data)
         self._require_stage_checks_passed(Stage.CODE_GENERATION)
         self._append_timeline(
             "code_generation",
@@ -611,7 +627,14 @@ class Orchestrator:
             stage=Stage.DATA_DISCOVERY,
         )
 
-    def _run_code_checks(self, analysis: AnalysisArtifact) -> None:
+    def _run_code_checks(
+        self,
+        analysis: AnalysisArtifact,
+        *,
+        chart_brief: ChartBriefArtifact | None = None,
+        honesty: Any | None = None,
+        data: DataArtifact | None = None,
+    ) -> None:
         self._apply_checkpoint(
             CodeExecutionCheckpoint().evaluate(analysis),
             name="CodeExecutionCheckpoint",
@@ -637,6 +660,56 @@ class Orchestrator:
             name="ChartPromiseCheckpoint",
             stage=Stage.CODE_GENERATION,
         )
+        self._apply_checkpoint(
+            honesty if honesty is not None else ChartHonestyCheckpoint().evaluate(analysis),
+            name="ChartHonestyCheckpoint",
+            stage=Stage.CODE_GENERATION,
+        )
+        self._apply_checkpoint(
+            ChartLabelCheckpoint().evaluate(analysis),
+            name="ChartLabelCheckpoint",
+            stage=Stage.CODE_GENERATION,
+        )
+        self._apply_checkpoint(
+            ChartBriefCheckpoint().evaluate(
+                chart_brief,
+                data,
+                question=self.state.question,
+            ),
+            name="ChartBriefCheckpoint",
+            stage=Stage.CODE_GENERATION,
+        )
+
+    def _design_chart(self, plan: PlannerArtifact, data: DataArtifact) -> ChartBriefArtifact:
+        worker = self.worker
+        brief: ChartBriefArtifact | None = None
+        if hasattr(worker, "design_chart"):
+            try:
+                designed = worker.design_chart(plan, data)
+                brief = ChartBriefArtifact.from_dict(designed.to_dict())
+            except Exception:
+                brief = None
+        if brief is None:
+            brief = build_chart_brief(plan, data, question=self.state.question)
+        self._save_json_artifact("chart_brief", brief)
+        return brief
+
+    def _write_code(
+        self,
+        plan: PlannerArtifact,
+        data: DataArtifact,
+        chart_brief: ChartBriefArtifact,
+    ) -> CodeArtifact:
+        method = self.worker.write_code
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "chart_brief" in parameters or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+        ):
+            return method(plan, data, chart_brief=chart_brief)
+        return method(plan, data)
 
     def _run_answer_checks(
         self,

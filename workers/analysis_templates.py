@@ -106,6 +106,20 @@ series_ids = [series_id for series_id in input_data["series_ids"] if series_id i
 if len(series_ids) < 2:
     raise RuntimeError("Relationship analysis requires at least two fetched FRED series.")
 
+brief = (input_data.get("metadata") or {}).get("chart_brief") or {}
+brief_layout = str(brief.get("layout") or "single").lower().replace("-", "_")
+brief_transforms = [str(item).lower() for item in (brief.get("transforms") or [])]
+brief_title = brief.get("title") or ""
+brief_units = brief.get("units") or "percent"
+brief_y_label = brief.get("y_label") or "percent change"
+brief_notes = brief.get("notes") or ""
+brief_type = brief.get("chart_type") or "line"
+brief_y0 = bool(brief.get("y_starts_at_zero"))
+wants_growth = (not brief_transforms) or any(
+    token in " ".join(brief_transforms)
+    for token in ("growth", "yoy", "qoq", "mom", "zscore", "z-score", "percent")
+)
+
 def sorted_rows(series_id):
     return sorted(observations[series_id], key=lambda row: row["date"])
 
@@ -191,37 +205,51 @@ levels_incompatible = (
     min(left_amp, right_amp) > 0
     and max(left_amp, right_amp) / min(left_amp, right_amp) >= 10.0
 )
+overlap_n = len(growth[left_id])
+growth_notes = brief_notes or (
+    "Growth rates share a percent axis so the correlation is visually readable. "
+    "Raw levels are not forced onto one scale. Mixed frequencies aligned with "
+    "last-observation-carried-forward; overlap n is reported on the correlation metric."
+)
+if "overlap" not in growth_notes.lower():
+    growth_notes = f"{growth_notes} Overlap n={overlap_n}."
 growth_chart = {
-    "type": "line",
-    "layout": "single",
+    "type": brief_type if brief_type in {"line", "scatter", "bars", "panels"} else "line",
+    "layout": "single" if wants_growth else brief_layout or "single",
     "shared_y_axis": True,
-    "title": f"Period-over-period growth in {left_id} and {right_id}",
+    "title": brief_title or f"Period-over-period growth in {left_id} and {right_id}",
     "x_field": "date",
     "y_field": [f"{left_id}_growth", f"{right_id}_growth"],
-    "unit": "percent",
-    "y_label": "percent change",
+    "unit": brief_units or "percent",
+    "y_label": brief_y_label or "percent change",
     "series_id": ",".join(series_ids),
+    "series_ids": list(series_ids),
+    "y_starts_at_zero": brief_y0,
     "data": chart_rows,
-    "notes": (
-        "Growth rates share a percent axis so the correlation is visually readable. "
-        "Raw levels are not forced onto one scale."
-    ),
+    "notes": growth_notes,
 }
-if levels_incompatible:
+levels_layout = "stacked" if brief_layout in {"stacked", "panels", "small_multiples"} else "dual_axis"
+if levels_incompatible or brief_layout in {"dual_axis", "stacked", "panels"}:
     levels_chart = {
         "type": "line",
-        "layout": "dual_axis",
+        "layout": levels_layout if levels_incompatible or brief_layout != "single" else "dual_axis",
         "shared_y_axis": False,
-        "title": f"{left_id} and {right_id} levels (dual axis)",
+        "title": f"{left_id} and {right_id} levels ({levels_layout.replace('_', ' ')})",
         "x_field": "date",
         "y_field": [left_id, right_id],
         "y_left": left_id,
         "y_right": right_id,
-        "y_left_label": left_id,
-        "y_right_label": right_id,
+        "y_left_label": f"{left_id} (source units)",
+        "y_right_label": f"{right_id} (source units)",
+        "unit": "mixed native units",
         "series_id": ",".join(series_ids),
+        "series_ids": list(series_ids),
+        "y_starts_at_zero": False,
         "data": level_rows,
-        "notes": "Independent y-axes because the native units differ by an order of magnitude.",
+        "notes": (
+            "Independent scales because native units differ. This companion chart is "
+            "not the correlation visual; growth rates are on a shared percent axis."
+        ),
     }
 else:
     levels_chart = {
@@ -231,9 +259,16 @@ else:
         "title": f"{left_id} and {right_id} over the overlapping window",
         "x_field": "date",
         "y_field": [left_id, right_id],
+        "unit": "source units",
+        "y_label": "source units",
         "series_id": ",".join(series_ids),
+        "series_ids": list(series_ids),
+        "y_starts_at_zero": False,
         "data": level_rows,
+        "notes": "Levels share an axis because native amplitudes are comparable.",
     }
+
+charts = [growth_chart, levels_chart] if wants_growth else [levels_chart, growth_chart]
 
 analysis_output = {
     "tables": [
@@ -243,7 +278,7 @@ analysis_output = {
                 {
                     "left_series": left_id,
                     "right_series": right_id,
-                    "overlap_periods": len(growth[left_id]),
+                    "overlap_periods": overlap_n,
                     "growth_correlation": correlation,
                     "start_date": first["date"],
                     "end_date": latest["date"],
@@ -260,7 +295,7 @@ analysis_output = {
         },
         {
             "name": "overlap_periods",
-            "value": len(growth[left_id]),
+            "value": overlap_n,
             "unit": "periods",
             "source_series": list(series_ids),
         },
@@ -286,19 +321,18 @@ analysis_output = {
             "metric_refs": ["growth_correlation"],
         }
     ],
-    "charts": [
-        growth_chart,
-        levels_chart,
-    ],
+    "charts": charts,
     "method_notes": (
         "Aligned the lower-frequency series dates with last-observation-carried-forward "
         "values from higher-frequency series, then computed Pearson correlation of "
         "period-over-period percent changes. This is a contemporaneous association, "
-        "not a causal estimate or a full lead-lag scan."
+        "not a causal estimate or a full lead-lag scan. Chart layout follows the "
+        "structured chart brief when one is present in input_data metadata."
     ),
     "warnings": [
         "Series may have different native frequencies; alignment can undersample a monthly series.",
         "Correlation of growth rates is not proof of causation.",
+        "The latest aligned period may be partial if the higher-frequency series has not closed.",
     ],
 }
 """

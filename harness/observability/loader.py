@@ -128,6 +128,7 @@ def _load_live_run(run_id: str, runs_dir: Path) -> RunArtifacts:
         "data_selection": read("selected_data.json", {}),
         "code": code,
         "analysis": read("analysis.json", {}),
+        "chart_brief": read("chart_brief.json", {}),
         "draft": draft,
         "checker": read("checker.json", {}),
         "state": read("state.json", {}),

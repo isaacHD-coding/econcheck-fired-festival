@@ -17,13 +17,13 @@ class WorkerInterfaceTests(unittest.TestCase):
 
         self.assertEqual(
             protocol_methods,
-            {"plan", "select_data", "write_code", "draft_answer"},
+            {"plan", "select_data", "design_chart", "write_code", "draft_answer"},
         )
 
     def test_mock_worker_has_required_methods(self) -> None:
         worker = MockWorker()
 
-        for method_name in ["plan", "select_data", "write_code", "draft_answer"]:
+        for method_name in ["plan", "select_data", "design_chart", "write_code", "draft_answer"]:
             with self.subTest(method_name=method_name):
                 self.assertTrue(callable(getattr(worker, method_name)))
 

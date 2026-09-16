@@ -384,6 +384,57 @@ def test_openai_worker_keeps_model_correlation_draft(monkeypatch) -> None:
     assert "materially higher" not in draft.answer
 
 
+def test_openai_worker_design_chart_falls_back_when_model_json_is_invalid(monkeypatch) -> None:
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        assert schema_name == "chart_brief_artifact"
+        return {"claim": "incomplete"}
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = ISAAC_QUESTION
+    brief = worker.design_chart(_relationship_plan(), _cpi_and_gdp_data())
+
+    assert set(brief.series_ids) == {"CPIAUCSL", "GDPC1"}
+    assert "growth" in brief.transforms
+
+
+def test_openai_worker_write_code_includes_chart_brief_and_design_advice(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_call_openai_json(*, schema_name, instructions, input_payload, **kwargs):
+        captured["schema_name"] = schema_name
+        captured["instructions"] = instructions
+        captured["payload"] = input_payload
+        return {
+            "code": (
+                "analysis_output = {"
+                "'tables': [], "
+                "'metrics': [], "
+                "'claims': [], "
+                "'charts': [{'type': 'line', 'title': 'CPIAUCSL vs GDPC1', 'data': []}], "
+                "'method_notes': 'model-correlation-code', "
+                "'warnings': []}"
+            )
+        }
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = ISAAC_QUESTION
+    brief = worker.design_chart(_relationship_plan(), _cpi_and_gdp_data())
+    worker.write_code(_relationship_plan(), _cpi_and_gdp_data(), chart_brief=brief)
+
+    assert captured["schema_name"] == "code_artifact"
+    instructions = str(captured["instructions"])
+    assert "Follow chart_brief exactly" in instructions
+    assert "dwarf" in instructions.lower()
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["chart_brief"]["series_ids"] == brief.series_ids
+    assert "growth" in payload["chart_brief"]["transforms"]
+
+
 def test_relationship_analysis_code_runs_for_cpi_and_gdp() -> None:
     from workers.analysis_templates import relationship_analysis_code
 

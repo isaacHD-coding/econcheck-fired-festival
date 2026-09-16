@@ -5,6 +5,9 @@ from types import SimpleNamespace
 from harness.checkpoints import (
     CHECKPOINT_REGISTRY,
     AnswerGroundingCheckpoint,
+    ChartBriefCheckpoint,
+    ChartHonestyCheckpoint,
+    ChartLabelCheckpoint,
     ChartPromiseCheckpoint,
     CodeExecutionCheckpoint,
     DataCompletenessCheckpoint,
@@ -15,7 +18,7 @@ from harness.checkpoints import (
     SourceProvenanceCheckpoint,
     SuccessCriteriaCheckpoint,
 )
-from workers.artifacts import AnalysisArtifact, DataArtifact, DraftArtifact
+from workers.artifacts import AnalysisArtifact, ChartBriefArtifact, DataArtifact, DraftArtifact
 
 
 def valid_analysis(metrics: list | None = None) -> AnalysisArtifact:
@@ -77,6 +80,9 @@ def test_checkpoint_registry_contains_required_checkpoints():
         "OutputShapeCheckpoint",
         "MathSanityCheckpoint",
         "ChartPromiseCheckpoint",
+        "ChartHonestyCheckpoint",
+        "ChartLabelCheckpoint",
+        "ChartBriefCheckpoint",
     }
     assert checkpoint_names("answer") == {
         "AnswerGroundingCheckpoint",
@@ -266,6 +272,121 @@ def test_chart_promise_checkpoint_fails_without_charts():
     assert result.passed is False
     assert result.alarm is not None
     assert result.alarm.retry_from == "code_generation"
+
+
+def test_chart_honesty_checkpoint_fails_dwarf_shared_axis():
+    analysis = valid_analysis()
+    analysis.charts = [
+        {
+            "type": "line",
+            "layout": "single",
+            "y_field": ["CPIAUCSL", "GDPC1"],
+            "data": [
+                {"date": "2021-01-01", "CPIAUCSL": 260.0, "GDPC1": 19000.0},
+                {"date": "2022-01-01", "CPIAUCSL": 280.0, "GDPC1": 21000.0},
+            ],
+        }
+    ]
+
+    result = ChartHonestyCheckpoint().evaluate(analysis)
+
+    assert result.passed is False
+    assert result.alarm is not None
+    assert result.alarm.retry_from == "code_generation"
+
+
+def test_chart_honesty_checkpoint_passes_growth_overlay():
+    analysis = valid_analysis()
+    analysis.charts = [
+        {
+            "type": "line",
+            "layout": "single",
+            "y_field": ["CPIAUCSL_growth", "GDPC1_growth"],
+            "unit": "percent",
+            "series_id": "CPIAUCSL,GDPC1",
+            "data": [
+                {"date": "2021-04-01", "CPIAUCSL_growth": 1.2, "GDPC1_growth": 0.4},
+            ],
+        }
+    ]
+
+    result = ChartHonestyCheckpoint().evaluate(analysis)
+
+    assert result.passed is True
+
+
+def test_chart_label_checkpoint_requires_units_and_series_ids():
+    analysis = valid_analysis()
+    analysis.charts = [
+        {
+            "type": "line",
+            "y_field": ["CPIAUCSL_growth", "GDPC1_growth"],
+            "data": [{"date": "2021-04-01", "CPIAUCSL_growth": 1.2, "GDPC1_growth": 0.4}],
+        }
+    ]
+
+    result = ChartLabelCheckpoint().evaluate(analysis)
+
+    assert result.passed is False
+    assert result.alarm.retry_from == "code_generation"
+
+    analysis.charts[0]["unit"] = "percent"
+    analysis.charts[0]["series_ids"] = ["CPIAUCSL", "GDPC1"]
+    result = ChartLabelCheckpoint().evaluate(analysis)
+    assert result.passed is True
+
+
+def test_chart_brief_checkpoint_requires_validated_multi_series_brief():
+    data = DataArtifact(
+        series_ids=["CPIAUCSL", "GDPC1"],
+        observations={"CPIAUCSL": [], "GDPC1": []},
+        metadata={"source": "FRED"},
+    )
+    missing = ChartBriefCheckpoint().evaluate(None, data, question="correlation of inflation and GDP")
+    assert missing.passed is False
+    assert missing.alarm.retry_from == "code_generation"
+
+    invented = ChartBriefCheckpoint().evaluate(
+        ChartBriefArtifact(
+            claim="Comovement of inflation and made-up output.",
+            series_ids=["CPIAUCSL", "FAKE123"],
+            transforms=["growth"],
+            layout="single",
+            y_starts_at_zero=False,
+            time_window_rationale="Overlap window.",
+            annotations=[],
+            title="Inflation vs fake series",
+            x_label="date",
+            y_label="percent",
+            units="percent",
+            notes="Would invent a series.",
+            chart_type="line",
+        ),
+        data,
+        question="correlation of inflation and GDP",
+    )
+    assert invented.passed is False
+
+    valid = ChartBriefCheckpoint().evaluate(
+        ChartBriefArtifact(
+            claim="Growth in CPIAUCSL and GDPC1 is associated.",
+            series_ids=["CPIAUCSL", "GDPC1"],
+            transforms=["growth"],
+            layout="single",
+            y_starts_at_zero=False,
+            time_window_rationale="Overlapping fetched window.",
+            annotations=[],
+            title="Period-over-period growth: CPI (CPIAUCSL) vs real GDP (GDPC1)",
+            x_label="date",
+            y_label="percent change",
+            units="percent",
+            notes="LOCF alignment; report overlap n.",
+            chart_type="line",
+        ),
+        data,
+        question="correlation of inflation and GDP",
+    )
+    assert valid.passed is True
 
 
 def test_answer_grounding_checkpoint_passes_when_referenced_metrics_exist():
