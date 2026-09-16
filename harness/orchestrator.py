@@ -74,6 +74,7 @@ RETRY_STAGES = {
 DEFAULT_RUN_DEADLINE_SECONDS = 180.0
 MAX_OPENAI_TIMEOUT_RETRIES_PER_STAGE = 1
 MIN_TIMEOUT_RETRY_SECONDS = 15.0
+MAX_COMPARISON_CHECKER_CODEGEN_RETRIES = 2
 
 
 class StageControl(Exception):
@@ -112,6 +113,8 @@ class Orchestrator:
         self._timeout_retries: dict[str, int] = {}
         self._write_code_attempts = 0
         self._comparison_codegen_fallback_used = False
+        self._force_comparison_template = False
+        self._comparison_checker_codegen_retries = 0
         self._checks: list[dict[str, Any]] = []
         self._guardrails: list[dict[str, Any]] = []
         self._timeline: list[dict[str, Any]] = []
@@ -621,11 +624,33 @@ class Orchestrator:
         self._save_json_artifact("checker", checker_artifact)
 
         if not checker_artifact.passed:
+            retry_from = checker_artifact.retry_from or "draft_answer"
+            if (
+                retry_from == "code_generation"
+                and _comparison_codegen_fallback_eligible(self.state.question, plan, data)
+            ):
+                self._comparison_checker_codegen_retries += 1
+                if (
+                    self._comparison_checker_codegen_retries
+                    >= MAX_COMPARISON_CHECKER_CODEGEN_RETRIES
+                ):
+                    self._fail_with_alarm(
+                        type="checker_failed",
+                        message=(
+                            "Checker did not approve the CPI vs PCE analysis after "
+                            f"{MAX_COMPARISON_CHECKER_CODEGEN_RETRIES} code_generation "
+                            "retries. Stopped instead of rewriting OpenAI codegen."
+                        ),
+                        context=checker_artifact.to_dict(),
+                        retry_from="code_generation",
+                        recommended_action="escalate",
+                    )
+                self._force_comparison_template = True
             self._fail_with_alarm(
                 type="checker_failed",
                 message="Checker did not approve the draft answer.",
                 context=checker_artifact.to_dict(),
-                retry_from=checker_artifact.retry_from or "draft_answer",
+                retry_from=retry_from,
             )
         return checker_artifact
 
@@ -761,6 +786,17 @@ class Orchestrator:
         data: DataArtifact,
         chart_brief: ChartBriefArtifact,
     ) -> CodeArtifact:
+        if self._should_force_comparison_template(plan, data):
+            self._write_code_attempts += 1
+            self._comparison_codegen_fallback_used = True
+            self._force_comparison_template = False
+            data.metadata = dict(data.metadata or {})
+            data.metadata["chart_brief"] = chart_brief.to_dict()
+            self._notify(
+                Stage.CODE_GENERATION.value,
+                "Using the compact calendar YoY CPI vs PCE template instead of another OpenAI rewrite.",
+            )
+            return CodeArtifact(code=comparison_analysis_code())
         method = self.worker.write_code
         try:
             parameters = inspect.signature(method).parameters
@@ -773,6 +809,19 @@ class Orchestrator:
             return method(plan, data, chart_brief=chart_brief)
         self._write_code_attempts += 1
         return method(plan, data)
+
+    def _should_force_comparison_template(
+        self,
+        plan: PlannerArtifact,
+        data: DataArtifact,
+    ) -> bool:
+        if not _comparison_codegen_fallback_eligible(self.state.question, plan, data):
+            return False
+        if self._force_comparison_template:
+            return True
+        if self._comparison_checker_codegen_retries >= 1:
+            return True
+        return self._write_code_attempts >= 1
 
     def _recover_comparison_analysis(
         self,

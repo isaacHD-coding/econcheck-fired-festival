@@ -398,73 +398,64 @@ brief_notes = brief.get("notes") or ""
 brief_type = brief.get("chart_type") or "line"
 brief_y0 = bool(brief.get("y_starts_at_zero"))
 SERIES_NAMES = {
-    "CPIAUCSL": {"name": "CPI all items", "growth": "CPI inflation", "level": "CPI all items"},
-    "PCEPI": {"name": "PCE price index", "growth": "PCE inflation", "level": "PCE price index"},
-    "GDPC1": {"name": "real GDP", "growth": "Real GDP growth", "level": "Real GDP"},
+    "CPIAUCSL": {"name": "CPI all items", "growth": "CPI inflation"},
+    "PCEPI": {"name": "PCE price index", "growth": "PCE inflation"},
 }
 
 def series_name(series_id, kind="name"):
     info = SERIES_NAMES.get(series_id) or {}
     if kind == "growth":
         return info.get("growth") or (series_id + " inflation")
-    if kind == "level":
-        return info.get("level") or series_id
     return info.get("name") or series_id
 
-def notes_are_instructions(text):
-    blob = " ".join(str(text or "").lower().split())
-    if not blob:
-        return False
-    if blob.startswith("do not "):
-        return True
-    return "do not place" in blob
+def month_key(date):
+    text = str(date)
+    return text[:7] if len(text) >= 7 else text
 
-def sorted_rows(series_id):
-    return sorted(observations[series_id], key=lambda row: row["date"])
+def prior_year_key(key):
+    return f"{int(key[:4]) - 1:04d}-{key[5:7]}"
 
-anchor_id = min(series_ids, key=lambda series_id: len(observations[series_id]))
-other_ids = [series_id for series_id in series_ids if series_id != anchor_id]
+def series_by_month(series_id):
+    by_month = {}
+    for row in observations[series_id]:
+        key = month_key(row.get("date"))
+        if len(key) != 7 or row.get("value") is None:
+            continue
+        by_month[key] = {"date": str(row["date"])[:10], "value": float(row["value"])}
+    return by_month
 
-def locf_value(rows, target_date):
-    value = None
-    for row in rows:
-        if row["date"] <= target_date:
-            value = row["value"]
-        else:
-            break
-    return value
-
-aligned = []
-for row in sorted_rows(anchor_id):
-    point = {"date": row["date"], anchor_id: row["value"]}
-    complete = True
-    for other_id in other_ids:
-        value = locf_value(sorted_rows(other_id), row["date"])
-        if value is None:
-            complete = False
-            break
-        point[other_id] = value
-    if complete:
-        aligned.append(point)
-
-if len(aligned) < 13:
-    raise RuntimeError("Not enough overlapping observations for year-over-year comparison.")
+def calendar_yoy(by_month):
+    yoy = {}
+    for key, row in by_month.items():
+        prior = by_month.get(prior_year_key(key))
+        if prior is None or prior["value"] == 0:
+            continue
+        yoy[key] = {
+            "date": row["date"],
+            "value": ((row["value"] / prior["value"]) - 1.0) * 100.0,
+        }
+    return yoy
 
 left_id, right_id = series_ids[0], series_ids[1]
-lag = 12 if len(aligned) >= 24 else 4
+left_levels = series_by_month(left_id)
+right_levels = series_by_month(right_id)
+left_yoy = calendar_yoy(left_levels)
+right_yoy = calendar_yoy(right_levels)
+common = sorted(set(left_yoy) & set(right_yoy))
+if len(common) < 8:
+    raise RuntimeError("Not enough overlapping calendar year-over-year months.")
+
 yoy_rows = []
 gaps = []
-for index in range(lag, len(aligned)):
-    current = aligned[index]
-    prior = aligned[index - lag]
-    left_yoy = 0.0 if prior[left_id] == 0 else ((current[left_id] / prior[left_id]) - 1.0) * 100.0
-    right_yoy = 0.0 if prior[right_id] == 0 else ((current[right_id] / prior[right_id]) - 1.0) * 100.0
-    gap = left_yoy - right_yoy
+for key in common:
+    left = left_yoy[key]["value"]
+    right = right_yoy[key]["value"]
+    gap = left - right
     gaps.append(gap)
     yoy_rows.append({
-        "date": current["date"],
-        left_id + "_yoy": round(left_yoy, 4),
-        right_id + "_yoy": round(right_yoy, 4),
+        "date": left_yoy[key]["date"],
+        left_id + "_yoy": round(left, 4),
+        right_id + "_yoy": round(right, 4),
         "inflation_gap": round(gap, 4),
     })
 
@@ -475,16 +466,20 @@ latest_gap = latest["inflation_gap"]
 avg_gap = sum(gaps) / len(gaps)
 left_field = left_id + "_yoy"
 right_field = right_id + "_yoy"
-if notes_are_instructions(brief_notes):
+raw_common = sorted(set(left_levels) & set(right_levels))
+latest_raw_month = raw_common[-1] if raw_common else latest["date"][:7]
+if str(brief_notes).lower().startswith("do not "):
     brief_notes = ""
 notes = brief_notes or (
-    "Year-over-year percent change in "
+    "Calendar year-over-year percent change in "
     + series_name(left_id)
     + " (" + left_id + ") and "
     + series_name(right_id)
-    + " (" + right_id + "), "
+    + " (" + right_id + "); "
     + str(len(yoy_rows))
-    + " overlapping periods."
+    + " overlapping months. Latest common raw month "
+    + latest_raw_month
+    + "."
 )
 title = brief_title if brief_title else (
     series_name(left_id, "growth") + " vs " + series_name(right_id, "growth")
@@ -505,6 +500,7 @@ analysis_output = {
                     "five_year_average_gap": round(avg_gap, 2),
                     "overlap_periods": len(yoy_rows),
                     "end_date": latest["date"],
+                    "latest_common_raw_month": latest_raw_month,
                 }
             ],
         }
@@ -576,13 +572,17 @@ analysis_output = {
         }
     ],
     "method_notes": (
-        "Aligned overlapping dates, then computed year-over-year percent changes "
-        "and the gap (first series minus second). Index bases differ, so raw levels "
-        "are not compared on one axis."
+        "Year-over-year percent uses the same calendar month minus 12 months "
+        "via date keys (YYYY-MM), never a positional 12-row shift. A month is "
+        "kept only when that series has both the current observation and the "
+        "prior-year month; series are then inner-joined on those dates. Latest "
+        "common raw month is "
+        + latest_raw_month
+        + ". Index bases differ, so raw levels are not compared on one axis."
     ),
     "warnings": [
         "CPI and PCE use different baskets and index bases; the gap is not a forecast.",
-        "The latest year-over-year reading may use a partial month.",
+        "Months missing a current or prior-year observation are dropped rather than filled.",
     ],
 }
 """
@@ -639,7 +639,8 @@ def comparison_draft(analysis: AnalysisArtifact) -> DraftArtifact:
         f"{lead}{avg_bit}\n\n"
         f"{_sentence_name(left_name)} ({left}) and {right_name} ({right}) "
         "are the FRED series used here.\n\n"
-        f"The comparison uses year-over-year percent changes{overlap_bit}. "
+        f"The comparison uses calendar year-over-year percent changes{overlap_bit} "
+        "(same month last year, not a positional 12-row shift). "
         "Different index bases mean raw levels are not compared directly."
     )
     return DraftArtifact(

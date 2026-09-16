@@ -8,7 +8,7 @@ import harness.orchestrator as orchestrator_module
 from harness.orchestrator import Orchestrator
 from harness.state import RunState, Stage
 from harness.tools.fred import SeriesSearchResult
-from workers.artifacts import DataArtifact
+from workers.artifacts import CheckerArtifact, DataArtifact
 from workers.mock_checker import MockChecker
 from workers.mock_worker import MockWorker
 
@@ -717,6 +717,167 @@ def test_empty_metrics_missing_charts_retry_is_bounded_for_single_series(
     )
 
 
+def test_checker_failure_falls_back_to_calendar_yoy_template(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class PositionalYoYWorker(MockWorker):
+        def write_code(self, plan, data, chart_brief=None):
+            from workers.artifacts import CodeArtifact
+
+            return CodeArtifact(code=_positional_yoy_code())
+
+    class AlignmentChecker:
+        def review(self, state, plan, data, analysis, draft):
+            notes = analysis.method_notes.lower()
+            chart_dates = [
+                str(row.get("date") or "")
+                for chart in analysis.charts
+                if isinstance(chart, dict)
+                for row in (chart.get("data") or [])
+                if isinstance(row, dict)
+            ]
+            calendar_ok = "calendar month minus 12" in notes
+            extra_month = any(item.startswith("2026-08") for item in chart_dates)
+            if calendar_ok and not extra_month:
+                return CheckerArtifact(
+                    passed=True,
+                    issues=[],
+                    retry_from="",
+                    explanation="Calendar YoY is grounded.",
+                )
+            return CheckerArtifact(
+                passed=False,
+                issues=["YoY is positional or includes a month past the last raw PCEPI observation."],
+                retry_from="code_generation",
+                explanation="Alignment is not calendar-grounded.",
+            )
+
+    monkeypatch.setattr(orchestrator_module, "fred_search", _search_cpi_and_pce)
+    monkeypatch.setattr(orchestrator_module, "fred_fetch", _fetch_cpi_and_pce_with_missing_month)
+
+    state = RunState(
+        "calendar-yoy-fallback",
+        CPI_PCE_QUESTION,
+        Stage.INPUT,
+        0,
+        max_turns=6,
+    )
+    orchestrator = Orchestrator(
+        state,
+        runs_dir=tmp_path,
+        worker=PositionalYoYWorker(),
+        checker=AlignmentChecker(),
+        fred_api_key="judge-key",
+        deadline_seconds=None,
+    )
+    final_state = orchestrator.run()
+
+    assert final_state.current_stage is Stage.RELEASED
+    assert orchestrator._write_code_attempts == 2
+    assert orchestrator._comparison_checker_codegen_retries == 1
+    assert final_state.retry_count < 6
+    assert (tmp_path / "calendar-yoy-fallback" / "final_answer.json").is_file()
+    analysis = json.loads((tmp_path / "calendar-yoy-fallback" / "analysis.json").read_text())
+    chart_dates = [
+        str(row.get("date") or "")[:7]
+        for row in analysis["charts"][0]["data"]
+    ]
+    assert "2026-08" not in chart_dates
+    assert "2025-11" in chart_dates
+    nov = next(row for row in analysis["charts"][0]["data"] if str(row["date"]).startswith("2025-11"))
+    calendar_yoy = ((159.0 / 147.0) - 1.0) * 100.0
+    positional_yoy = ((159.0 / 146.0) - 1.0) * 100.0
+    assert abs(nov["CPIAUCSL_yoy"] - calendar_yoy) < 0.02
+    assert abs(nov["CPIAUCSL_yoy"] - positional_yoy) > 0.5
+    final_answer = json.loads((tmp_path / "calendar-yoy-fallback" / "final_answer.json").read_text())
+    assert "PCE" in final_answer["answer"] or "pce" in final_answer["answer"].lower()
+
+
+def test_comparison_checker_failures_do_not_loop_openai_codegen(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class AlwaysRejectChecker:
+        def review(self, state, plan, data, analysis, draft):
+            return CheckerArtifact(
+                passed=False,
+                issues=["reject"],
+                retry_from="code_generation",
+                explanation="Always reject.",
+            )
+
+    monkeypatch.setattr(orchestrator_module, "fred_search", _search_cpi_and_pce)
+    monkeypatch.setattr(orchestrator_module, "fred_fetch", _fetch_cpi_and_pce)
+
+    state = RunState(
+        "checker-loop",
+        CPI_PCE_QUESTION,
+        Stage.INPUT,
+        0,
+        max_turns=6,
+    )
+    orchestrator = Orchestrator(
+        state,
+        runs_dir=tmp_path,
+        worker=MockWorker(),
+        checker=AlwaysRejectChecker(),
+        fred_api_key="judge-key",
+        deadline_seconds=None,
+    )
+    final_state = orchestrator.run()
+
+    assert final_state.current_stage is Stage.ESCALATED
+    assert orchestrator._write_code_attempts <= 2
+    assert orchestrator._comparison_checker_codegen_retries <= 2
+    assert final_state.retry_count < 6
+    assert sum(1 for alarm in final_state.alarms if alarm.type == "checker_failed") <= 2
+
+
+def _positional_yoy_code() -> str:
+    return """
+observations = input_data["observations"]
+series_ids = list(input_data["series_ids"])
+left, right = series_ids[0], series_ids[1]
+
+def rows(series_id):
+    return sorted(observations[series_id], key=lambda row: row["date"])
+
+left_rows, right_rows = rows(left), rows(right)
+count = min(len(left_rows), len(right_rows))
+yoy_rows = []
+for index in range(12, count):
+    left_yoy = ((left_rows[index]["value"] / left_rows[index - 12]["value"]) - 1.0) * 100.0
+    right_yoy = ((right_rows[index]["value"] / right_rows[index - 12]["value"]) - 1.0) * 100.0
+    yoy_rows.append({
+        "date": left_rows[index]["date"],
+        left + "_yoy": round(left_yoy, 4),
+        right + "_yoy": round(right_yoy, 4),
+    })
+latest = yoy_rows[-1]
+analysis_output = {
+    "tables": [],
+    "metrics": [
+        {"name": "latest_left_yoy_percent", "value": latest[left + "_yoy"], "unit": "percent", "source_series": [left]},
+        {"name": "latest_right_yoy_percent", "value": latest[right + "_yoy"], "unit": "percent", "source_series": [right]},
+        {"name": "latest_inflation_gap_percent", "value": round(latest[left + "_yoy"] - latest[right + "_yoy"], 2), "unit": "percentage points", "source_series": series_ids},
+    ],
+    "claims": [{"text": "gap", "metric_refs": ["latest_inflation_gap_percent"]}],
+    "charts": [{
+        "type": "line",
+        "title": "CPI vs PCE",
+        "x_field": "date",
+        "y_field": [left + "_yoy", right + "_yoy"],
+        "series_ids": series_ids,
+        "unit": "percent",
+        "data": yoy_rows,
+    }],
+    "method_notes": "positional 12-row lag",
+    "warnings": [],
+}
+"""
+
+
 def _search_cpi_and_pce(query: str, *, api_key: str | None = None):
     query_l = query.lower()
     if "pce" in query_l or "pcepi" in query_l or "personal consumption" in query_l:
@@ -741,6 +902,38 @@ def _fetch_cpi_and_pce(series_ids, *, api_key=None, observation_start=None):
     return DataArtifact(
         series_ids=list(series_ids),
         observations={series_id: _fresh_rows(series_id) for series_id in series_ids},
+        metadata={"source": "FRED", "series": {}},
+    )
+
+
+def _fetch_cpi_and_pce_with_missing_month(series_ids, *, api_key=None, observation_start=None):
+    cpi_rows = []
+    pce_rows = []
+    for year in range(2021, 2027):
+        for month in range(1, 13):
+            if year == 2026 and month > 8:
+                break
+            date = f"{year}-{month:02d}-01"
+            cpi_value = 100.0 + (year - 2021) * 12 + month
+            pce_value = 50.0 + (year - 2021) * 12 + month
+            if year == 2025 and month == 10:
+                pce_rows.append({"series_id": "PCEPI", "date": date, "value": pce_value})
+                continue
+            if year == 2026 and month == 8:
+                cpi_rows.append({"series_id": "CPIAUCSL", "date": date, "value": cpi_value})
+                continue
+            if year == 2026 and month > 7:
+                continue
+            cpi_rows.append({"series_id": "CPIAUCSL", "date": date, "value": cpi_value})
+            pce_rows.append({"series_id": "PCEPI", "date": date, "value": pce_value})
+    observations = {}
+    if "CPIAUCSL" in series_ids:
+        observations["CPIAUCSL"] = cpi_rows
+    if "PCEPI" in series_ids:
+        observations["PCEPI"] = pce_rows
+    return DataArtifact(
+        series_ids=[series_id for series_id in series_ids if series_id in observations],
+        observations=observations,
         metadata={"source": "FRED", "series": {}},
     )
 

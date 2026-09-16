@@ -561,6 +561,31 @@ def test_comparison_analysis_code_runs_for_cpi_and_pce() -> None:
         for series_id in (metric.get("source_series") or [])
     }
     assert source_series >= {"CPIAUCSL", "PCEPI"}
+    assert "calendar month minus 12" in analysis.method_notes
+    assert "positional" in analysis.method_notes
+
+
+def test_comparison_template_uses_calendar_yoy_when_a_month_is_missing() -> None:
+    from workers.analysis_templates import comparison_analysis_code
+
+    analysis = run_analysis_code(
+        CodeArtifact(code=comparison_analysis_code()),
+        _cpi_and_pce_data_with_missing_month(),
+    )
+
+    chart = analysis.charts[0]
+    by_date = {row["date"][:7]: row for row in chart["data"]}
+    assert "2025-11" in by_date
+    assert "2025-10" not in by_date
+    assert "2026-08" not in by_date
+    cpi_nov = by_date["2025-11"]["CPIAUCSL_yoy"]
+    calendar_yoy = ((159.0 / 147.0) - 1.0) * 100.0
+    positional_yoy = ((159.0 / 146.0) - 1.0) * 100.0
+    assert abs(cpi_nov - calendar_yoy) < 0.02
+    assert abs(cpi_nov - positional_yoy) > 0.5
+    table = analysis.tables[0]["rows"][0]
+    assert table["latest_common_raw_month"] == "2026-07"
+    assert analysis.charts[0]["data"][-1]["date"].startswith("2026-07")
 
 
 CPI_PCE_QUESTION = (
@@ -626,6 +651,9 @@ def test_write_code_guidance_keeps_generated_scripts_short() -> None:
     assert "metric['value']" in WRITE_CODE_GUIDANCE or "value: number" in lowered
     assert "charts[].series" in WRITE_CODE_GUIDANCE
     assert "latest_inflation_gap_percent" in WRITE_CODE_GUIDANCE
+    assert "calendar" in lowered
+    assert "positional" in lowered
+    assert "inner-join" in lowered or "inner join" in lowered
     assert "adaptive chart design" not in lowered
     assert "correlation is acceptable" not in lowered
 
@@ -832,6 +860,33 @@ def _cpi_and_pce_data() -> DataArtifact:
             )
             cpi_value += 0.8
             pce_value += 0.4
+    return DataArtifact(
+        series_ids=["CPIAUCSL", "PCEPI"],
+        observations={"CPIAUCSL": cpi_rows, "PCEPI": pce_rows},
+        metadata={"source": "FRED"},
+    )
+
+
+def _cpi_and_pce_data_with_missing_month() -> DataArtifact:
+    cpi_rows = []
+    pce_rows = []
+    for year in range(2021, 2027):
+        for month in range(1, 13):
+            if year == 2026 and month > 8:
+                break
+            date = f"{year}-{month:02d}-01"
+            cpi_value = 100.0 + (year - 2021) * 12 + month
+            pce_value = 50.0 + (year - 2021) * 12 + month
+            if year == 2025 and month == 10:
+                pce_rows.append({"series_id": "PCEPI", "date": date, "value": pce_value})
+                continue
+            if year == 2026 and month == 8:
+                cpi_rows.append({"series_id": "CPIAUCSL", "date": date, "value": cpi_value})
+                continue
+            if year == 2026 and month > 7:
+                continue
+            cpi_rows.append({"series_id": "CPIAUCSL", "date": date, "value": cpi_value})
+            pce_rows.append({"series_id": "PCEPI", "date": date, "value": pce_value})
     return DataArtifact(
         series_ids=["CPIAUCSL", "PCEPI"],
         observations={"CPIAUCSL": cpi_rows, "PCEPI": pce_rows},

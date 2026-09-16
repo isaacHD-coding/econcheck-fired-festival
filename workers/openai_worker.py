@@ -755,9 +755,14 @@ WRITE_CODE_GUIDANCE = (
     "design_notes in the generated program.\n"
     "For two monthly price indexes comparing inflation (for example CPI vs PCE / "
     "CPIAUCSL vs PCEPI): compute year-over-year percent change for each series and "
-    "the inflation gap. Do not add Pearson correlation, median/mean batteries, "
-    "missing-month audits, sampled-row tables, or extra charts unless the question "
-    "asked for them.\n"
+    "the inflation gap. YoY MUST be calendar-grounded: for month M use the "
+    "observation in the same calendar month 12 months earlier via YYYY-MM date "
+    "keys, never a positional 12-row shift. Drop any month that lacks both the "
+    "current and prior-year observation for that series; inner-join the two YoY "
+    "series on remaining dates. Do not LOCF a shorter series onto a later month "
+    "(if PCEPI ends 2026-07, do not emit a 2026-08 PCE YoY). Do not add Pearson "
+    "correlation, median/mean batteries, missing-month audit tables, sampled-row "
+    "tables, or extra charts unless the question asked for them.\n"
     "Assign analysis_output as a dict that matches the harness AnalysisArtifact "
     "exactly. Top-level keys: tables (list), metrics (list), claims (list), "
     "charts (list), method_notes (string), warnings (list).\n"
@@ -798,12 +803,14 @@ WRITE_CODE_GUIDANCE = (
 )
 
 SIMPLE_RETRY_WRITE_CODE_GUIDANCE = (
-    "RETRY: the previous analysis_output failed MathSanity (metric_values empty or "
-    "non-numeric) and/or ChartPromise (missing chart descriptors). Do not write "
-    "another open-ended novel. Emit a MINIMAL YoY+gap script: a few metrics with "
-    "numeric value fields, and one chart matching schema X "
+    "RETRY: the previous analysis_output failed MathSanity, ChartPromise, or "
+    "checker review (often misaligned YoY). Do not write another open-ended novel. "
+    "Emit a MINIMAL calendar-YoY+gap script: for each month M, divide by the same "
+    "calendar month last year (date keys), drop months missing either observation, "
+    "inner-join dates, numeric metric values, and one chart matching schema X "
     "(type/title/x_field/y_field/series_ids/unit/data rows). Keep under 80 lines. "
-    "No nested charts[].series, no Pearson, no missing-month audits."
+    "No nested charts[].series, no Pearson, no positional 12-lag, no LOCF past the "
+    "last raw month of a series."
 )
 
 
