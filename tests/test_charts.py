@@ -1,3 +1,5 @@
+import pytest
+
 from harness.charts import (
     normalize_analysis_charts,
     normalize_chart,
@@ -147,6 +149,86 @@ def test_render_charts_does_not_plot_incompatible_series_on_one_axis() -> None:
         y = kwargs.get("y")
         if isinstance(y, list):
             assert set(y) != {"CPIAUCSL", "GDPC1"}
+
+
+def test_dual_axis_iso_dates_use_temporal_x() -> None:
+    pytest.importorskip("altair")
+    pytest.importorskip("pandas")
+    from harness.charts import build_dual_axis_chart, render_charts
+
+    chart = {
+        "type": "line",
+        "layout": "dual_axis",
+        "shared_y_axis": False,
+        "title": "CPI all items and Real GDP levels",
+        "x_field": "date",
+        "y_field": ["CPIAUCSL", "GDPC1"],
+        "y_left": "CPIAUCSL",
+        "y_right": "GDPC1",
+        "y_left_label": "CPI all items",
+        "y_right_label": "Real GDP",
+        "data": [
+            {"date": "2021-01-01", "CPIAUCSL": 260.0, "GDPC1": 19000.0},
+            {"date": "2022-01-01", "CPIAUCSL": 280.0, "GDPC1": 20000.0},
+            {"date": "2023-04-01", "CPIAUCSL": 300.0, "GDPC1": 21000.0},
+        ],
+    }
+
+    layered = build_dual_axis_chart(chart, chart["data"], "date", ["CPIAUCSL", "GDPC1"])
+    assert layered is not None
+    spec = layered.to_dict()
+    x_encodings = [
+        layer["encoding"]["x"]
+        for layer in spec.get("layer", [])
+        if isinstance(layer, dict) and "encoding" in layer
+    ]
+    assert x_encodings
+    assert all(item.get("type") == "temporal" for item in x_encodings)
+
+    class FakeST:
+        def __init__(self) -> None:
+            self.calls: list[tuple] = []
+
+        def markdown(self, *args, **kwargs) -> None:
+            self.calls.append(("markdown", args, kwargs))
+
+        def caption(self, *args, **kwargs) -> None:
+            self.calls.append(("caption", args, kwargs))
+
+        def line_chart(self, *args, **kwargs) -> None:
+            self.calls.append(("line_chart", args, kwargs))
+
+        def altair_chart(self, spec, **kwargs) -> None:
+            self.calls.append(("altair_chart", (spec,), kwargs))
+            spec.to_dict()
+
+        def expander(self, *args, **kwargs):
+            from contextlib import contextmanager
+
+            @contextmanager
+            def _cm():
+                yield self
+
+            return _cm()
+
+        def json(self, *args, **kwargs) -> None:
+            self.calls.append(("json", args, kwargs))
+
+        def info(self, *args, **kwargs) -> None:
+            self.calls.append(("info", args, kwargs))
+
+    fake = FakeST()
+    render_charts(fake, [chart])
+    altair_calls = [item for item in fake.calls if item[0] == "altair_chart"]
+    assert altair_calls
+    rendered = altair_calls[0][1][0].to_dict()
+    rendered_x = [
+        layer["encoding"]["x"]
+        for layer in rendered.get("layer", [])
+        if isinstance(layer, dict) and "encoding" in layer
+    ]
+    assert rendered_x
+    assert all(item.get("type") == "temporal" for item in rendered_x)
 
 
 def _cpi_and_gdp_data() -> DataArtifact:

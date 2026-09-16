@@ -231,31 +231,65 @@ def _render_dual_axis(
     x_field: str,
     fields: list[str],
 ) -> bool:
+    layered = build_dual_axis_chart(chart, data, x_field, fields)
+    if layered is None:
+        return False
+    try:
+        st.altair_chart(layered, width="stretch")
+    except TypeError:
+        st.altair_chart(layered)
+    except Exception:
+        return False
+    return True
+
+
+def build_dual_axis_chart(
+    chart: dict[str, Any],
+    data: list[dict[str, Any]],
+    x_field: str,
+    fields: list[str],
+) -> Any:
+    """Build a dual-axis Altair chart with an explicit temporal x encoding."""
+
     try:
         import altair as alt
+        import pandas as pd
     except ImportError:
-        return False
+        return None
 
     left = str(chart.get("y_left") or fields[0])
     right = str(chart.get("y_right") or fields[1])
     left_title = str(chart.get("y_left_label") or left)
     right_title = str(chart.get("y_right_label") or right)
     zero = bool(chart.get("y_starts_at_zero"))
-    base = alt.Chart(data).encode(x=alt.X(x_field, title=str(chart.get("x_label") or x_field)))
-    left_layer = base.mark_line(color="#4C78A8").encode(
-        y=alt.Y(left, axis=alt.Axis(title=left_title, titleColor="#4C78A8"), scale=alt.Scale(zero=zero)),
-        tooltip=[x_field, left, right],
-    )
-    right_layer = base.mark_line(color="#F58518").encode(
-        y=alt.Y(right, axis=alt.Axis(title=right_title, titleColor="#F58518"), scale=alt.Scale(zero=zero)),
-        tooltip=[x_field, left, right],
-    )
-    layered = alt.layer(left_layer, right_layer).resolve_scale(y="independent")
+    x_title = str(chart.get("x_label") or x_field)
     try:
-        st.altair_chart(layered, width="stretch")
-    except TypeError:
-        st.altair_chart(layered)
-    return True
+        frame = pd.DataFrame(list(data))
+        if x_field in frame.columns:
+            frame[x_field] = pd.to_datetime(frame[x_field], errors="coerce")
+        x_enc = alt.X(x_field, type="temporal", title=x_title)
+        base = alt.Chart(frame).encode(x=x_enc)
+        left_layer = base.mark_line(color="#4C78A8").encode(
+            y=alt.Y(
+                left,
+                type="quantitative",
+                axis=alt.Axis(title=left_title, titleColor="#4C78A8"),
+                scale=alt.Scale(zero=zero),
+            ),
+            tooltip=[x_field, left, right],
+        )
+        right_layer = base.mark_line(color="#F58518").encode(
+            y=alt.Y(
+                right,
+                type="quantitative",
+                axis=alt.Axis(title=right_title, titleColor="#F58518"),
+                scale=alt.Scale(zero=zero),
+            ),
+            tooltip=[x_field, left, right],
+        )
+        return alt.layer(left_layer, right_layer).resolve_scale(y="independent")
+    except Exception:
+        return None
 
 
 def _layout_name(chart: dict[str, Any]) -> str:
