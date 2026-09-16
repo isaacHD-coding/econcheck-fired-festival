@@ -34,7 +34,7 @@ from workers.artifacts import (
     DraftArtifact,
     PlannerArtifact,
 )
-from workers.chart_briefs import CHART_DESIGN_ADVICE, build_chart_brief, repair_chart_brief
+from workers.chart_briefs import build_chart_brief, repair_chart_brief
 from workers.openai_client import (
     DEFAULT_OPENAI_MODEL,
     OpenAIClientError,
@@ -202,35 +202,21 @@ class OpenAIWorker:
             "plan": plan.to_dict(),
             "data": _compact_data_payload(data_summary),
             "chart_brief": brief.to_dict(),
+            "codegen_constraints": {
+                "max_lines": 120,
+                "max_helpers": 4,
+                "one_chart": True,
+                "follow_chart_brief": True,
+                "price_index_comparison": "yoy_percent_and_gap_only",
+            },
         }
         return self._call_artifact(
             schema_name="code_artifact",
             schema=CODE_SCHEMA,
             instructions=_stage_instructions(
                 "Code generation",
-                "Write complete Python analysis code for the supplied DataArtifact.",
-                (
-                    "Return Python only in the JSON code field. The code must assign "
-                    "analysis_output as a dict. Top-level analysis_output['tables'], "
-                    "analysis_output['metrics'], analysis_output['claims'], "
-                    "analysis_output['charts'], and analysis_output['warnings'] must "
-                    "all be lists. analysis_output['method_notes'] must be a string. "
-                    "Use only input_data. Do not call FRED, do not use the network, "
-                    "do not use subprocesses, do not install packages, and do not "
-                    "read or write files. Use only the Python standard library. "
-                    "If input_data contains more than one series, analyze the "
-                    "relationship among those series (aligned growth-rate correlation "
-                    "is acceptable) instead of a CPI-only five-year trend. If the "
-                    "question is last year's vs this year's GDP growth and only one "
-                    "GDP series is present, correlate year-over-year growth with a "
-                    "one-year lag of the same series. "
-                    + CHART_DESIGN_ADVICE
-                    + " Follow chart_brief for layout and transforms. User-facing "
-                    "chart titles, legends, and notes must be plain English "
-                    "('CPI growth', 'Real GDP growth'). Chart notes are a short "
-                    "caption (units, alignment, n) only. Never put 'Do not…' harness "
-                    "design rules in analysis.charts notes."
-                ),
+                "Write a short Python analysis script for the supplied DataArtifact.",
+                WRITE_CODE_GUIDANCE,
             ),
             input_payload=payload,
             artifact_cls=CodeArtifact,
@@ -741,6 +727,36 @@ HARNESS_BOUNDARY_RULES = (
     "design charts, write code, and draft answers. You may not call FRED, fetch data, "
     "execute code, route retries, escalate failures, or release answers. The harness "
     "owns tools, execution, checkpoints, alarms, persistence, observability, and release."
+)
+
+WRITE_CODE_GUIDANCE = (
+    "Keep generated code under 80-120 lines. Prefer a short claim-focused script "
+    "that computes the few metrics the question needs plus one clear chart. Do not "
+    "write a general-purpose statistics library.\n"
+    "Hard limits: do not define many helpers (prefer 0-3 small functions; inline "
+    "the rest). Reuse the supplied chart_brief for layout, transforms, title, "
+    "labels, and notes. Do not re-implement date-alignment frameworks or restate "
+    "design_notes in the generated program.\n"
+    "For two monthly price indexes comparing inflation (for example CPI vs PCE / "
+    "CPIAUCSL vs PCEPI): compute year-over-year percent change for each series and "
+    "the inflation gap. Do not add Pearson correlation, median/mean batteries, "
+    "missing-month audits, sampled-row tables, or extra charts unless the question "
+    "asked for them.\n"
+    "Return Python only in the JSON code field. The code must assign "
+    "analysis_output as a dict. Top-level analysis_output['tables'], "
+    "analysis_output['metrics'], analysis_output['claims'], "
+    "analysis_output['charts'], and analysis_output['warnings'] must all be lists. "
+    "analysis_output['method_notes'] must be a string. Use only input_data. Do not "
+    "call FRED, do not use the network, do not use subprocesses, do not install "
+    "packages, and do not read or write files. Use only the Python standard library. "
+    "If input_data contains more than one series, answer the user's actual question "
+    "about those series instead of a CPI-only five-year trend. If the question is "
+    "last year's vs this year's GDP growth and only one GDP series is present, "
+    "compare year-over-year growth with a one-year lag of the same series.\n"
+    "Follow chart_brief. User-facing chart titles, legends, and notes must be plain "
+    "English ('CPI growth', 'Real GDP growth', 'PCE inflation'). Chart notes are a "
+    "short caption (units, alignment, n) only. Never put 'Do not…' harness design "
+    "rules in analysis.charts notes."
 )
 
 

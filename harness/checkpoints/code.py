@@ -4,11 +4,62 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import math
+import re
 from typing import Any
 
 from harness.charts import would_dwarf_a_series, y_fields
 from harness.checkpoints.base import CheckpointResult
-from workers.artifacts import AnalysisArtifact, ArtifactValidationError, ChartBriefArtifact
+from workers.artifacts import AnalysisArtifact, ArtifactValidationError, ChartBriefArtifact, CodeArtifact
+
+
+# Prompt target is ~80–120 lines. This fail-closed ceiling is high enough for
+# local analysis templates (relationship ~263 nonempty lines) but rejects the
+# kitchen-sink stdlib scripts that stalled OpenAI JSON completion.
+MAX_ANALYSIS_CODE_NONEMPTY_LINES = 300
+MAX_ANALYSIS_CODE_HELPERS = 8
+MAX_ANALYSIS_CODE_CHARS = 14000
+_HELPER_DEF_RE = re.compile(r"^\s*def\s+\w+", re.MULTILINE)
+
+
+class CodeSimplicityCheckpoint:
+    """Reject over-engineered analysis scripts before the sandbox runs them."""
+
+    def evaluate(self, code_artifact: Any) -> CheckpointResult:
+        code = _read_analysis_code(code_artifact)
+        stats = analysis_code_stats(code)
+        reasons: list[str] = []
+        if stats["nonempty_lines"] > MAX_ANALYSIS_CODE_NONEMPTY_LINES:
+            reasons.append(
+                f"{stats['nonempty_lines']} nonempty lines "
+                f"(max {MAX_ANALYSIS_CODE_NONEMPTY_LINES})"
+            )
+        if stats["helpers"] > MAX_ANALYSIS_CODE_HELPERS:
+            reasons.append(
+                f"{stats['helpers']} helper functions "
+                f"(max {MAX_ANALYSIS_CODE_HELPERS})"
+            )
+        if stats["chars"] > MAX_ANALYSIS_CODE_CHARS:
+            reasons.append(
+                f"{stats['chars']} characters (max {MAX_ANALYSIS_CODE_CHARS})"
+            )
+        if reasons:
+            return CheckpointResult.fail_result(
+                checkpoint_name=self.__class__.__name__,
+                stage="code_generation",
+                message=(
+                    "Generated analysis code is too large. Write a short "
+                    "claim-focused script (about 80–120 lines, few helpers) "
+                    "that computes the metrics the question needs plus one "
+                    "chart. Follow chart_brief; do not re-implement alignment "
+                    "frameworks, Pearson/median batteries, or missing-month "
+                    "audits unless asked. "
+                    + "; ".join(reasons)
+                    + "."
+                ),
+                retry_from="code_generation",
+                context=stats,
+            )
+        return CheckpointResult.pass_result("Analysis code stays within size limits.")
 
 
 class CodeExecutionCheckpoint:
@@ -194,6 +245,26 @@ class ChartBriefCheckpoint:
                 },
             )
         return CheckpointResult.pass_result("Chart brief is present and validated.")
+
+
+def analysis_code_stats(code: str) -> dict[str, int]:
+    text = str(code or "")
+    nonempty_lines = [line for line in text.splitlines() if line.strip()]
+    return {
+        "total_lines": len(text.splitlines()),
+        "nonempty_lines": len(nonempty_lines),
+        "helpers": len(_HELPER_DEF_RE.findall(text)),
+        "chars": len(text),
+    }
+
+
+def _read_analysis_code(code_artifact: Any) -> str:
+    if isinstance(code_artifact, str):
+        return code_artifact
+    if isinstance(code_artifact, CodeArtifact):
+        return code_artifact.code
+    code = _read_field(code_artifact, "code", "")
+    return str(code or "")
 
 
 def _read_field(item: Any, field_name: str, default: Any = None) -> Any:

@@ -16,6 +16,7 @@ from harness.checkpoints import (
     ChartLabelCheckpoint,
     ChartPromiseCheckpoint,
     CodeExecutionCheckpoint,
+    CodeSimplicityCheckpoint,
     DataCompletenessCheckpoint,
     FreshnessCheckpoint,
     InformationSufficiencyCheckpoint,
@@ -480,6 +481,25 @@ class Orchestrator:
         code_artifact = self._write_code(plan, data, chart_brief)
         code_artifact = CodeArtifact.from_dict(code_artifact.to_dict())
         self._save_text_artifact("generated_code", "generated_code.py", code_artifact.code)
+
+        simplicity = CodeSimplicityCheckpoint().evaluate(code_artifact)
+        self._apply_checkpoint(
+            simplicity,
+            name="CodeSimplicityCheckpoint",
+            stage=Stage.CODE_GENERATION,
+        )
+        if not simplicity.passed:
+            alarm = simplicity.alarm
+            self._fail_with_alarm(
+                type="code_simplicity_failed",
+                message=(
+                    alarm.message
+                    if alarm is not None
+                    else "Generated analysis code is too large."
+                ),
+                context=dict(alarm.context) if alarm is not None else {},
+                retry_from="code_generation",
+            )
 
         code_output_path = self._run_dir() / "code_output.json"
         self.state.artifacts["code_output"] = "code_output.json"

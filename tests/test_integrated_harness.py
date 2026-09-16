@@ -497,6 +497,76 @@ def test_write_code_failures_stop_at_max_turns(monkeypatch, tmp_path: Path) -> N
     assert final_state.retry_count > max_turns
 
 
+def test_oversized_generated_code_is_not_executed(monkeypatch, tmp_path: Path) -> None:
+    from harness.orchestrator import StageControl
+    from workers.artifacts import CodeArtifact, PlannerArtifact
+    from workers.chart_briefs import build_chart_brief
+
+    executed = {"n": 0}
+
+    def fake_run(*args, **kwargs):
+        executed["n"] += 1
+        raise AssertionError("sandbox must not run oversized analysis code")
+
+    monkeypatch.setattr(orchestrator_module, "run_analysis_code", fake_run)
+
+    verbose = (
+        "\n".join(f"def helper_{index}(value):\n    return value" for index in range(12))
+        + "\n"
+        + "\n".join(f"unused_{index} = {index}" for index in range(320))
+        + "\nanalysis_output = {"
+        "'tables': [], 'metrics': [], 'claims': [], 'charts': [], "
+        "'method_notes': '', 'warnings': []}\n"
+    )
+
+    class VerboseWorker:
+        def design_chart(self, plan, data):
+            return build_chart_brief(plan, data, question=CPI_PCE_QUESTION)
+
+        def write_code(self, plan, data, chart_brief=None):
+            return CodeArtifact(code=verbose)
+
+    plan = PlannerArtifact(
+        question_type="comparison",
+        economic_concepts=["CPI inflation", "PCE inflation"],
+        measurement_strategy="Compare CPIAUCSL and PCEPI year-over-year inflation.",
+        information_requirements=["CPIAUCSL", "PCEPI"],
+        search_queries=["CPIAUCSL", "PCEPI"],
+        required_outputs=["inflation gap"],
+        success_criteria=["Report the CPI-PCE inflation difference"],
+    )
+    data = _fetch_cpi_and_pce(["CPIAUCSL", "PCEPI"])
+    state = RunState(
+        "verbose-codegen",
+        CPI_PCE_QUESTION,
+        Stage.CODE_GENERATION,
+        0,
+        max_turns=1,
+    )
+    orchestrator = Orchestrator(
+        state,
+        runs_dir=tmp_path,
+        worker=VerboseWorker(),
+        checker=MockChecker(),
+        fred_api_key="judge-key",
+        deadline_seconds=None,
+    )
+    try:
+        orchestrator._code_generation_stage(plan, data)
+        raised = False
+    except StageControl:
+        raised = True
+
+    assert raised is True
+    assert executed["n"] == 0
+    assert any(
+        check["name"] == "CodeSimplicityCheckpoint" and not check["passed"]
+        for check in orchestrator._checks
+    )
+    assert any(alarm.type == "code_simplicity_failed" for alarm in orchestrator.state.alarms)
+    assert (tmp_path / "verbose-codegen" / "generated_code.py").is_file()
+
+
 def _search_cpi_and_pce(query: str, *, api_key: str | None = None):
     query_l = query.lower()
     if "pce" in query_l or "pcepi" in query_l or "personal consumption" in query_l:

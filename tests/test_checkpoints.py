@@ -10,6 +10,7 @@ from harness.checkpoints import (
     ChartLabelCheckpoint,
     ChartPromiseCheckpoint,
     CodeExecutionCheckpoint,
+    CodeSimplicityCheckpoint,
     DataCompletenessCheckpoint,
     FreshnessCheckpoint,
     InformationSufficiencyCheckpoint,
@@ -18,7 +19,7 @@ from harness.checkpoints import (
     SourceProvenanceCheckpoint,
     SuccessCriteriaCheckpoint,
 )
-from workers.artifacts import AnalysisArtifact, ChartBriefArtifact, DataArtifact, DraftArtifact
+from workers.artifacts import AnalysisArtifact, ChartBriefArtifact, CodeArtifact, DataArtifact, DraftArtifact
 
 
 def valid_analysis(metrics: list | None = None) -> AnalysisArtifact:
@@ -76,6 +77,7 @@ def test_checkpoint_registry_contains_required_checkpoints():
         "InformationSufficiencyCheckpoint",
     }
     assert checkpoint_names("code") == {
+        "CodeSimplicityCheckpoint",
         "CodeExecutionCheckpoint",
         "OutputShapeCheckpoint",
         "MathSanityCheckpoint",
@@ -449,3 +451,85 @@ def test_success_criteria_checkpoint_passes_grounded_cpi_answer():
 
     assert result.passed is True
     assert result.alarm is None
+
+
+def _isaac_style_verbose_code() -> str:
+    helpers = """
+def _get_nested(data, *keys):
+    current = data
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+def _parse_month(value):
+    return str(value)[:7]
+
+def _month_minus_12(month):
+    year, mon = str(month).split("-")[:2]
+    year_i = int(year)
+    mon_i = int(mon) - 12
+    while mon_i <= 0:
+        mon_i += 12
+        year_i -= 1
+    return f"{year_i:04d}-{mon_i:02d}"
+
+def _fmt_num(value):
+    return round(float(value), 4)
+
+def _mean(values):
+    return sum(values) / len(values) if values else 0.0
+
+def _median(values):
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2] if ordered else 0.0
+
+def _pearson(xs, ys):
+    return 0.0
+
+def _series_map(rows):
+    return {row["date"]: row["value"] for row in rows}
+
+def _yoy_percent(current, prior):
+    return ((current / prior) - 1.0) * 100.0 if prior else None
+"""
+    padding = "\n".join(f"unused_{index} = {index}" for index in range(320))
+    return (
+        helpers
+        + "\n"
+        + padding
+        + "\nanalysis_output = {"
+        "'tables': [], 'metrics': [], 'claims': [], 'charts': [], "
+        "'method_notes': 'verbose', 'warnings': []}\n"
+    )
+
+
+def test_code_simplicity_checkpoint_fails_oversized_code():
+    result = CodeSimplicityCheckpoint().evaluate(
+        CodeArtifact(code=_isaac_style_verbose_code())
+    )
+
+    assert result.passed is False
+    assert result.alarm is not None
+    assert result.alarm.retry_from == "code_generation"
+    assert "too large" in result.alarm.message.lower()
+    assert "80" in result.alarm.message
+    assert result.alarm.context["helpers"] >= 9
+    assert result.alarm.context["nonempty_lines"] > 300
+
+
+def test_code_simplicity_checkpoint_passes_local_templates():
+    from workers.analysis_templates import (
+        canonical_cpi_analysis_code,
+        comparison_analysis_code,
+        relationship_analysis_code,
+    )
+
+    for code in (
+        canonical_cpi_analysis_code(),
+        comparison_analysis_code(),
+        relationship_analysis_code(),
+    ):
+        result = CodeSimplicityCheckpoint().evaluate(CodeArtifact(code=code))
+        assert result.passed is True, result.reason

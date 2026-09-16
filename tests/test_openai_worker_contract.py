@@ -17,7 +17,7 @@ from workers.openai_client import (
     OPENAI_PLAN_TIMEOUT_SECONDS,
     OpenAITimeoutError,
 )
-from workers.openai_worker import OpenAIWorker, OpenAIWorkerError, OpenAIWorkerTimeoutError
+from workers.openai_worker import OpenAIWorker, OpenAIWorkerError, OpenAIWorkerTimeoutError, WRITE_CODE_GUIDANCE
 
 
 QUESTION = "What has happened to CPI inflation over the last five years?"
@@ -606,6 +606,75 @@ def test_openai_worker_uses_comparison_template_without_openai_write_code(
     assert "pearson" not in code.code
 
 
+def test_write_code_guidance_keeps_generated_scripts_short() -> None:
+    lowered = WRITE_CODE_GUIDANCE.lower()
+    assert "80-120" in WRITE_CODE_GUIDANCE
+    assert "chart_brief" in lowered
+    assert "design_notes" in lowered
+    assert "year-over-year" in lowered
+    assert "inflation gap" in lowered
+    assert "missing-month" in lowered
+    assert "pearson" in lowered
+    assert "general-purpose statistics library" in lowered
+    assert "adaptive chart design" not in lowered
+    assert "correlation is acceptable" not in lowered
+
+
+def test_openai_write_code_openai_path_uses_concise_guidance(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_call_openai_json(*, schema_name, instructions, input_payload, **kwargs):
+        captured["schema_name"] = schema_name
+        captured["instructions"] = instructions
+        captured["payload"] = input_payload
+        return {
+            "code": (
+                "analysis_output = {"
+                "'tables': [], 'metrics': [], 'claims': [], 'charts': [], "
+                "'method_notes': 'computed from input_data', 'warnings': []}"
+            )
+        }
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = "How has the unemployment rate changed over the last five years?"
+    code = worker.write_code(_unemployment_plan(), _unemployment_data())
+
+    assert captured["schema_name"] == "code_artifact"
+    instructions = str(captured["instructions"])
+    assert WRITE_CODE_GUIDANCE in instructions
+    assert "80-120" in instructions
+    assert "Adaptive chart design" not in instructions
+    assert "correlation is acceptable" not in instructions
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["codegen_constraints"]["max_lines"] == 120
+    assert payload["codegen_constraints"]["price_index_comparison"] == (
+        "yoy_percent_and_gap_only"
+    )
+    assert isinstance(code, CodeArtifact)
+
+
+def test_cpi_pce_write_code_path_keeps_concise_codegen_contract(monkeypatch) -> None:
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        raise AssertionError(f"unexpected OpenAI call for {schema_name}")
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = CPI_PCE_QUESTION
+    code = worker.write_code(_comparison_plan(), _cpi_and_pce_data())
+
+    assert "80-120" in WRITE_CODE_GUIDANCE
+    assert "CPIAUCSL vs PCEPI" in WRITE_CODE_GUIDANCE
+    assert "latest_inflation_gap_percent" in code.code
+    assert "pearson" not in code.code
+    from harness.checkpoints.code import CodeSimplicityCheckpoint
+
+    assert CodeSimplicityCheckpoint().evaluate(code).passed is True
+
+
 def _comparison_plan() -> PlannerArtifact:
     return PlannerArtifact(
         question_type="comparison",
@@ -615,6 +684,30 @@ def _comparison_plan() -> PlannerArtifact:
         search_queries=["CPIAUCSL", "PCEPI"],
         required_outputs=["inflation gap"],
         success_criteria=["Report the CPI-PCE inflation difference"],
+    )
+
+
+def _unemployment_plan() -> PlannerArtifact:
+    return PlannerArtifact(
+        question_type="trend",
+        economic_concepts=["unemployment"],
+        measurement_strategy="Measure the change in UNRATE over five years.",
+        information_requirements=["UNRATE"],
+        search_queries=["UNRATE unemployment rate"],
+        required_outputs=["five-year unemployment change"],
+        success_criteria=["Answer cites UNRATE"],
+    )
+
+
+def _unemployment_data() -> DataArtifact:
+    rows = [
+        {"series_id": "UNRATE", "date": "2021-01-01", "value": 6.3},
+        {"series_id": "UNRATE", "date": "2026-01-01", "value": 4.1},
+    ]
+    return DataArtifact(
+        series_ids=["UNRATE"],
+        observations={"UNRATE": rows},
+        metadata={"source": "FRED"},
     )
 
 

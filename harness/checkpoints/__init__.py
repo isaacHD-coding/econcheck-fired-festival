@@ -11,6 +11,7 @@ from harness.checkpoints.code import (
     ChartLabelCheckpoint,
     ChartPromiseCheckpoint,
     CodeExecutionCheckpoint,
+    CodeSimplicityCheckpoint,
     MathSanityCheckpoint,
     OutputShapeCheckpoint,
 )
@@ -30,6 +31,7 @@ DATA_CHECKPOINTS = (
 )
 
 CODE_CHECKPOINTS = (
+    CodeSimplicityCheckpoint(),
     CodeExecutionCheckpoint(),
     OutputShapeCheckpoint(),
     MathSanityCheckpoint(),
@@ -62,6 +64,7 @@ __all__ = [
     "ChartPromiseCheckpoint",
     "CheckpointResult",
     "CodeExecutionCheckpoint",
+    "CodeSimplicityCheckpoint",
     "DATA_CHECKPOINTS",
     "DataCompletenessCheckpoint",
     "FreshnessCheckpoint",
