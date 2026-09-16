@@ -179,7 +179,15 @@ def test_information_sufficiency_requires_two_series_for_relationship_questions(
     assert result.alarm is not None
 
 
-def test_code_execution_checkpoint_passes_plain_analysis_artifact():
+def test_information_sufficiency_requires_two_series_for_cpi_pce_questions():
+    result = InformationSufficiencyCheckpoint().evaluate(
+        valid_data(),
+        selected_ids=["CPIAUCSL"],
+        question="What is the difference between CPI and PCE inflation over the last 5 years?",
+    )
+
+    assert result.passed is False
+    assert result.alarm is not None
     result = CodeExecutionCheckpoint().evaluate(valid_analysis())
 
     assert result.passed is True

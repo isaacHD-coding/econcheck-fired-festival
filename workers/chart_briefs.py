@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from harness.domain import is_canonical_cpi_demo_question, is_relationship_question, plan_requests_relationship
+from harness.domain import (
+    is_canonical_cpi_demo_question,
+    is_comparison_question,
+    is_relationship_question,
+    plan_requests_relationship,
+)
 from workers.artifacts import ChartBriefArtifact, DataArtifact, PlannerArtifact
 
 
@@ -53,6 +58,13 @@ SERIES_LABELS = {
         "aliases": ("cpi all", "consumer price", "inflation", "headline cpi"),
         "result": "inflation",
     },
+    "PCEPI": {
+        "name": "PCE price index",
+        "growth": "PCE inflation",
+        "level": "PCE price index",
+        "aliases": ("pce", "personal consumption", "pce inflation"),
+        "result": "PCE inflation",
+    },
     "GDPC1": {
         "name": "real GDP",
         "growth": "Real GDP growth",
@@ -95,6 +107,8 @@ def build_chart_brief(
 
     series_ids = _series_ids(data)
     units_by_id = _units_by_series(data)
+    if is_comparison_question(question) and len(series_ids) >= 2:
+        return _comparison_brief(series_ids, units_by_id, question=question)
     relationship = _is_relationship(plan, data, question)
     if relationship and len(series_ids) >= 2:
         return _relationship_brief(series_ids, units_by_id, question=question)
@@ -184,6 +198,49 @@ def repair_chart_brief(
         return ChartBriefArtifact.from_dict(payload)
     except (TypeError, ValueError):
         return fallback
+
+
+def _comparison_brief(
+    series_ids: list[str],
+    units_by_id: dict[str, str],
+    *,
+    question: str,
+) -> ChartBriefArtifact:
+    left, right = series_ids[0], series_ids[1]
+    title_left = plain_series_name(left)
+    title_right = plain_series_name(right)
+    return ChartBriefArtifact(
+        claim=(
+            f"The gap between {title_left} inflation and {title_right} inflation "
+            "over the overlapping five-year window."
+        ),
+        series_ids=list(series_ids),
+        transforms=["yoy"],
+        layout="single",
+        y_starts_at_zero=False,
+        time_window_rationale=(
+            "Use the overlapping fetched window. Year-over-year percent change "
+            "makes CPI and PCE comparable despite different index bases."
+        ),
+        annotations=[
+            "Recession shading omitted because no NBER recession series was fetched."
+        ],
+        title=f"{growth_legend_label(left)} vs {growth_legend_label(right)}",
+        x_label="date",
+        y_label="year-over-year percent",
+        units="percent",
+        notes=(
+            f"Year-over-year percent change in {title_left} ({left}) and "
+            f"{title_right} ({right}). Different index bases are not plotted as raw levels."
+        ),
+        chart_type="line",
+        y_left_label=growth_legend_label(left),
+        y_right_label=growth_legend_label(right),
+        design_notes=(
+            "Plot year-over-year inflation rates on one percent axis. Do not place "
+            "raw CPI and PCE index levels on one shared y-axis; the bases differ."
+        ),
+    )
 
 
 def _relationship_brief(

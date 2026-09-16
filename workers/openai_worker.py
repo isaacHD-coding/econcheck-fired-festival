@@ -7,13 +7,17 @@ from typing import Any, TypeVar
 
 from harness.domain import (
     is_canonical_cpi_demo_question,
+    is_comparison_question,
     is_relationship_question,
     plan_requests_relationship,
+    wanted_series_for_question,
 )
 from harness.state import RunState
 from workers.analysis_templates import (
     canonical_cpi_analysis_code,
     canonical_cpi_draft,
+    comparison_analysis_code,
+    comparison_draft,
     draft_uses_plain_series_names,
     looks_like_canned_cpi_draft,
     looks_like_jargony_relationship_draft,
@@ -103,14 +107,16 @@ class OpenAIWorker:
             "If the question asks about a relationship, correlation, anti-correlation, "
             "or more than one concept (for example inflation and real GDP), plan "
             "separate FRED search queries for each concept. Do not collapse that "
-            "question into a CPI-only five-year trend. If it compares last year's and "
+            "question into a CPI-only five-year trend. If it compares CPI and PCE "
+            "inflation, plan CPIAUCSL and PCEPI and the year-over-year gap—not a "
+            "CPI-only trend and not a GDP correlation. If it compares last year's and "
             "this year's GDP growth, plan one GDP series (GDPC1) and year-over-year "
             "growth versus its one-year lag—do not invent a second series. The "
             "canonical CPI demo question may prefer a query that can find CPIAUCSL. "
             "Charting is a later worker step: the plan should name the claim a chart "
             "must support, not dump every fetched series onto one axis."
         )
-        return self._call_artifact(
+        plan = self._call_artifact(
             schema_name="planner_artifact",
             schema=PLANNER_SCHEMA,
             instructions=_stage_instructions(
@@ -122,6 +128,7 @@ class OpenAIWorker:
             artifact_cls=PlannerArtifact,
             stage_label="plan",
         )
+        return _ensure_known_plan_queries(plan, question)
 
     def select_data(
         self,
@@ -150,14 +157,16 @@ class OpenAIWorker:
             artifact_cls=DataSelectionArtifact,
             stage_label="select_data",
         )
-        if _needs_relationship_analysis(self.question, plan, None) and selection.selected_series:
+        if _needs_multi_series_analysis(self.question, plan, None) and selection.selected_series:
             selection = _ensure_search_backed_series(
                 selection,
                 search_results,
-                _wanted_relationship_series(self.question, plan, search_results),
+                _wanted_series(self.question, plan, search_results),
             )
-        if not selection.selected_series:
-            if _needs_relationship_analysis(self.question, plan, None):
+        if not selection.selected_series or _missing_wanted_series(
+            selection, self.question, plan, search_results
+        ):
+            if _needs_multi_series_analysis(self.question, plan, None):
                 recovered = _relationship_selection(search_results, self.question, plan)
                 if recovered is not None:
                     return recovered
@@ -173,35 +182,9 @@ class OpenAIWorker:
         data_summary: DataArtifact,
     ) -> ChartBriefArtifact:
         fallback = build_chart_brief(plan, data_summary, question=self.question)
-        payload = {
-            "plan": plan.to_dict(),
-            "data": data_summary.to_dict(),
-            "fallback_brief": fallback.to_dict(),
-        }
-        try:
-            brief = self._call_artifact(
-                schema_name="chart_brief_artifact",
-                schema=CHART_BRIEF_SCHEMA,
-                instructions=_stage_instructions(
-                    "Chart design",
-                    "Produce a structured chart brief that analysis codegen must follow.",
-                    (
-                        CHART_DESIGN_ADVICE
-                        + " Use only series_ids present in the supplied DataArtifact. "
-                        "Do not invent FRED ids. Canonical CPI-only demos may keep a "
-                        "simple single line chart. For inflation vs real GDP correlation, "
-                        "prefer period-over-period growth on a shared percent axis, with "
-                        "dual-axis or stacked levels only as a companion when native "
-                        "units would dwarf a series."
-                    ),
-                ),
-                input_payload=payload,
-                artifact_cls=ChartBriefArtifact,
-                stage_label="design_chart",
-            )
-        except OpenAIWorkerError:
-            return fallback
-        return repair_chart_brief(brief, plan, data_summary, question=self.question)
+        # Chart design is harness-deterministic. An extra OpenAI round-trip here
+        # stacked on write_code and routinely exhausted the 3-minute run budget.
+        return repair_chart_brief(fallback, plan, data_summary, question=self.question)
 
     def write_code(
         self,
@@ -212,12 +195,15 @@ class OpenAIWorker:
         brief = chart_brief or build_chart_brief(plan, data_summary, question=self.question)
         if hasattr(data_summary, "metadata") and isinstance(data_summary.metadata, dict):
             data_summary.metadata["chart_brief"] = brief.to_dict()
+        template = _analysis_code_template(self.question, plan, data_summary)
+        if template is not None:
+            return CodeArtifact(code=template)
         payload = {
             "plan": plan.to_dict(),
-            "data": data_summary.to_dict(),
+            "data": _compact_data_payload(data_summary),
             "chart_brief": brief.to_dict(),
         }
-        code_artifact = self._call_artifact(
+        return self._call_artifact(
             schema_name="code_artifact",
             schema=CODE_SCHEMA,
             instructions=_stage_instructions(
@@ -250,15 +236,6 @@ class OpenAIWorker:
             artifact_cls=CodeArtifact,
             stage_label="write_code",
         )
-        series_ids = _series_ids(data_summary)
-        if _allow_canonical_cpi_fallback(self.question, plan, data_summary):
-            return CodeArtifact(code=canonical_cpi_analysis_code())
-        if _needs_relationship_analysis(self.question, plan, data_summary) and not _code_references_all_series(
-            code_artifact.code,
-            series_ids,
-        ):
-            return CodeArtifact(code=relationship_analysis_code())
-        return code_artifact
 
     def draft_answer(
         self,
@@ -269,6 +246,9 @@ class OpenAIWorker:
             "plan": plan.to_dict(),
             "analysis": analysis.to_dict(),
         }
+        templated = _draft_template(self.question, plan, analysis)
+        if templated is not None:
+            return templated
         draft = self._call_artifact(
             schema_name="draft_artifact",
             schema=DRAFT_SCHEMA,
@@ -401,7 +381,7 @@ def _relationship_selection(
     question: str,
     plan: PlannerArtifact,
 ) -> DataSelectionArtifact | None:
-    wanted = _wanted_relationship_series(question, plan, search_results)
+    wanted = _wanted_series(question, plan, search_results)
     selected = []
     normalized = _normalize_search_results(search_results)
     for series_id in wanted:
@@ -472,16 +452,110 @@ def _ensure_search_backed_series(
     )
 
 
-def _wanted_relationship_series(question: str, plan: PlannerArtifact, search_results: list) -> list[str]:
+def _ensure_known_plan_queries(plan: PlannerArtifact, question: str) -> PlannerArtifact:
+    wanted = wanted_series_for_question(question)
+    if not wanted:
+        return plan
+    queries = list(plan.search_queries)
+    blob = " ".join(queries).lower()
+    extras = {
+        "CPIAUCSL": "Consumer Price Index All Urban Consumers CPIAUCSL",
+        "PCEPI": "Personal Consumption Expenditures Chain-type Price Index PCEPI",
+        "GDPC1": "Real Gross Domestic Product GDPC1",
+    }
+    changed = False
+    for series_id in wanted:
+        token = series_id.lower()
+        if token not in blob and series_id in extras:
+            queries.append(extras[series_id])
+            blob = " ".join(queries).lower()
+            changed = True
+    if not changed:
+        return plan
+    payload = plan.to_dict()
+    payload["search_queries"] = queries
+    return PlannerArtifact.from_dict(payload)
+
+
+def _analysis_code_template(question: str, plan: Any, data: Any) -> str | None:
+    series_ids = _series_ids(data)
+    if _allow_canonical_cpi_fallback(question, plan, data):
+        return canonical_cpi_analysis_code()
+    if _needs_comparison_analysis(question, plan, data) and len(series_ids) >= 2:
+        return comparison_analysis_code()
+    if len(series_ids) >= 2:
+        return relationship_analysis_code()
+    return None
+
+
+def _draft_template(question: str, plan: Any, analysis: AnalysisArtifact) -> DraftArtifact | None:
+    if _is_comparison_analysis(analysis) or _needs_comparison_analysis(question, plan, analysis):
+        if _is_comparison_analysis(analysis):
+            return comparison_draft(analysis)
+    if _allow_canonical_cpi_fallback(question, plan, analysis) and _is_canonical_cpi_analysis(analysis):
+        return canonical_cpi_draft(analysis)
+    if _is_relationship_analysis(analysis):
+        return relationship_draft(analysis)
+    return None
+
+
+def _compact_data_payload(data: Any) -> dict[str, Any]:
+    """Send series metadata and a few sample rows, not five years of observations."""
+
+    if hasattr(data, "to_dict"):
+        raw = data.to_dict()
+    elif isinstance(data, dict):
+        raw = dict(data)
+    else:
+        raw = {}
+    observations = raw.get("observations") or {}
+    summaries: dict[str, Any] = {}
+    if isinstance(observations, dict):
+        for series_id, rows in observations.items():
+            if not isinstance(rows, list):
+                continue
+            ordered = sorted(
+                [row for row in rows if isinstance(row, dict)],
+                key=lambda row: str(row.get("date") or ""),
+            )
+            summaries[str(series_id)] = {
+                "n": len(ordered),
+                "start": ordered[0].get("date") if ordered else None,
+                "end": ordered[-1].get("date") if ordered else None,
+                "head": ordered[:2],
+                "tail": ordered[-2:],
+            }
+    metadata = dict(raw.get("metadata") or {})
+    metadata.pop("selected_series", None)
+    return {
+        "series_ids": list(raw.get("series_ids") or summaries),
+        "series_summaries": summaries,
+        "metadata": metadata,
+        "note": (
+            "Full observations are available at execution time as input_data. "
+            "Do not copy observation rows into generated code."
+        ),
+    }
+
+
+def _wanted_series(question: str, plan: PlannerArtifact, search_results: list) -> list[str]:
     text = f"{question} {_plan_blob(plan)}".lower()
     normalized = _normalize_search_results(search_results)
     searched_ids = [str(item.get("series_id")) for item in normalized if item.get("series_id")]
     wanted: list[str] = []
-    if "CPIAUCSL" in searched_ids and (
+    for series_id in wanted_series_for_question(question):
+        if series_id in searched_ids:
+            wanted.append(series_id)
+    if "CPIAUCSL" in searched_ids and "CPIAUCSL" not in wanted and (
         "inflation" in text or "cpi" in text or "cpiaucsl" in text
     ):
         wanted.append("CPIAUCSL")
-    if "GDPC1" in searched_ids and ("gdp" in text or "gdpc1" in text or "gross domestic" in text):
+    if "PCEPI" in searched_ids and ("pce" in text or "pcepi" in text or "personal consumption" in text):
+        if "PCEPI" not in wanted:
+            wanted.append("PCEPI")
+    if "GDPC1" in searched_ids and "GDPC1" not in wanted and (
+        "gdp" in text or "gdpc1" in text or "gross domestic" in text
+    ):
         wanted.append("GDPC1")
     for series_id in searched_ids:
         if series_id not in wanted and series_id.lower() in text:
@@ -489,14 +563,35 @@ def _wanted_relationship_series(question: str, plan: PlannerArtifact, search_res
     return wanted
 
 
+def _missing_wanted_series(
+    selection: DataSelectionArtifact,
+    question: str,
+    plan: PlannerArtifact,
+    search_results: list,
+) -> bool:
+    wanted = _wanted_series(question, plan, search_results)
+    if len(wanted) < 2:
+        return False
+    selected_ids = {item.get("series_id") for item in selection.selected_series}
+    return any(series_id not in selected_ids for series_id in wanted)
+
+
 def _allow_canonical_cpi_selection_recovery(question: str, plan: Any) -> bool:
-    if is_relationship_question(question) or plan_requests_relationship(plan):
+    if (
+        is_comparison_question(question)
+        or is_relationship_question(question)
+        or plan_requests_relationship(plan)
+    ):
         return False
     return not question or is_canonical_cpi_demo_question(question)
 
 
 def _allow_canonical_cpi_fallback(question: str, plan: Any, data_or_search: Any) -> bool:
-    if is_relationship_question(question) or plan_requests_relationship(plan):
+    if (
+        is_comparison_question(question)
+        or is_relationship_question(question)
+        or plan_requests_relationship(plan)
+    ):
         return False
     series_ids = _series_ids(data_or_search)
     if len(series_ids) > 1:
@@ -506,6 +601,22 @@ def _allow_canonical_cpi_fallback(question: str, plan: Any, data_or_search: Any)
     if series_ids and set(series_ids) != {"CPIAUCSL"}:
         return False
     return True
+
+
+def _needs_multi_series_analysis(question: str, plan: Any, data: Any) -> bool:
+    if _needs_comparison_analysis(question, plan, data):
+        return True
+    return _needs_relationship_analysis(question, plan, data)
+
+
+def _needs_comparison_analysis(question: str, plan: Any, data: Any) -> bool:
+    if is_comparison_question(question):
+        return True
+    blob = _plan_blob(plan).lower() if plan is not None else ""
+    if "pce" in blob or "pcepi" in blob:
+        return True
+    series_ids = set(_series_ids(data))
+    return {"CPIAUCSL", "PCEPI"} <= series_ids
 
 
 def _needs_relationship_analysis(question: str, plan: Any, data: Any) -> bool:
@@ -525,7 +636,18 @@ def _is_canonical_cpi_analysis(analysis: AnalysisArtifact) -> bool:
         "cpi_five_year_change_percent",
         "latest_yoy_inflation_percent",
         "latest_cpi_index",
-    }.issubset(metric_names) and "growth_correlation" not in metric_names
+    }.issubset(metric_names) and "growth_correlation" not in metric_names and (
+        "latest_inflation_gap_percent" not in metric_names
+    )
+
+
+def _is_comparison_analysis(analysis: AnalysisArtifact) -> bool:
+    metric_names = {
+        metric.get("name")
+        for metric in analysis.metrics
+        if isinstance(metric, dict) and isinstance(metric.get("name"), str)
+    }
+    return "latest_inflation_gap_percent" in metric_names
 
 
 def _is_relationship_analysis(analysis: AnalysisArtifact) -> bool:
@@ -536,6 +658,8 @@ def _is_relationship_analysis(analysis: AnalysisArtifact) -> bool:
     }
     if "growth_correlation" in metric_names:
         return True
+    if "latest_inflation_gap_percent" in metric_names:
+        return False
     source_series = {
         str(series_id)
         for metric in analysis.metrics

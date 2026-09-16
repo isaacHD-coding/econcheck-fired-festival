@@ -386,6 +386,279 @@ analysis_output = {
 """
 
 
+def comparison_analysis_code() -> str:
+    return """observations = input_data["observations"]
+series_ids = [series_id for series_id in input_data["series_ids"] if series_id in observations]
+if len(series_ids) < 2:
+    raise RuntimeError("Comparison analysis requires at least two fetched FRED series.")
+
+brief = (input_data.get("metadata") or {}).get("chart_brief") or {}
+brief_title = brief.get("title") or ""
+brief_notes = brief.get("notes") or ""
+brief_type = brief.get("chart_type") or "line"
+brief_y0 = bool(brief.get("y_starts_at_zero"))
+SERIES_NAMES = {
+    "CPIAUCSL": {"name": "CPI all items", "growth": "CPI inflation", "level": "CPI all items"},
+    "PCEPI": {"name": "PCE price index", "growth": "PCE inflation", "level": "PCE price index"},
+    "GDPC1": {"name": "real GDP", "growth": "Real GDP growth", "level": "Real GDP"},
+}
+
+def series_name(series_id, kind="name"):
+    info = SERIES_NAMES.get(series_id) or {}
+    if kind == "growth":
+        return info.get("growth") or (series_id + " inflation")
+    if kind == "level":
+        return info.get("level") or series_id
+    return info.get("name") or series_id
+
+def notes_are_instructions(text):
+    blob = " ".join(str(text or "").lower().split())
+    if not blob:
+        return False
+    if blob.startswith("do not "):
+        return True
+    return "do not place" in blob
+
+def sorted_rows(series_id):
+    return sorted(observations[series_id], key=lambda row: row["date"])
+
+anchor_id = min(series_ids, key=lambda series_id: len(observations[series_id]))
+other_ids = [series_id for series_id in series_ids if series_id != anchor_id]
+
+def locf_value(rows, target_date):
+    value = None
+    for row in rows:
+        if row["date"] <= target_date:
+            value = row["value"]
+        else:
+            break
+    return value
+
+aligned = []
+for row in sorted_rows(anchor_id):
+    point = {"date": row["date"], anchor_id: row["value"]}
+    complete = True
+    for other_id in other_ids:
+        value = locf_value(sorted_rows(other_id), row["date"])
+        if value is None:
+            complete = False
+            break
+        point[other_id] = value
+    if complete:
+        aligned.append(point)
+
+if len(aligned) < 13:
+    raise RuntimeError("Not enough overlapping observations for year-over-year comparison.")
+
+left_id, right_id = series_ids[0], series_ids[1]
+lag = 12 if len(aligned) >= 24 else 4
+yoy_rows = []
+gaps = []
+for index in range(lag, len(aligned)):
+    current = aligned[index]
+    prior = aligned[index - lag]
+    left_yoy = 0.0 if prior[left_id] == 0 else ((current[left_id] / prior[left_id]) - 1.0) * 100.0
+    right_yoy = 0.0 if prior[right_id] == 0 else ((current[right_id] / prior[right_id]) - 1.0) * 100.0
+    gap = left_yoy - right_yoy
+    gaps.append(gap)
+    yoy_rows.append({
+        "date": current["date"],
+        left_id + "_yoy": round(left_yoy, 4),
+        right_id + "_yoy": round(right_yoy, 4),
+        "inflation_gap": round(gap, 4),
+    })
+
+latest = yoy_rows[-1]
+latest_left = latest[left_id + "_yoy"]
+latest_right = latest[right_id + "_yoy"]
+latest_gap = latest["inflation_gap"]
+avg_gap = sum(gaps) / len(gaps)
+left_field = left_id + "_yoy"
+right_field = right_id + "_yoy"
+if notes_are_instructions(brief_notes):
+    brief_notes = ""
+notes = brief_notes or (
+    "Year-over-year percent change in "
+    + series_name(left_id)
+    + " (" + left_id + ") and "
+    + series_name(right_id)
+    + " (" + right_id + "), "
+    + str(len(yoy_rows))
+    + " overlapping periods."
+)
+title = brief_title if brief_title else (
+    series_name(left_id, "growth") + " vs " + series_name(right_id, "growth")
+)
+direction = "above" if latest_gap > 0 else "below" if latest_gap < 0 else "in line with"
+
+analysis_output = {
+    "tables": [
+        {
+            "name": "inflation_comparison",
+            "rows": [
+                {
+                    "left_series": left_id,
+                    "right_series": right_id,
+                    "latest_left_yoy": round(latest_left, 2),
+                    "latest_right_yoy": round(latest_right, 2),
+                    "latest_inflation_gap": round(latest_gap, 2),
+                    "five_year_average_gap": round(avg_gap, 2),
+                    "overlap_periods": len(yoy_rows),
+                    "end_date": latest["date"],
+                }
+            ],
+        }
+    ],
+    "metrics": [
+        {
+            "name": "latest_left_yoy_percent",
+            "value": round(latest_left, 2),
+            "unit": "percent",
+            "source_series": [left_id],
+        },
+        {
+            "name": "latest_right_yoy_percent",
+            "value": round(latest_right, 2),
+            "unit": "percent",
+            "source_series": [right_id],
+        },
+        {
+            "name": "latest_inflation_gap_percent",
+            "value": round(latest_gap, 2),
+            "unit": "percentage points",
+            "source_series": list(series_ids),
+        },
+        {
+            "name": "five_year_average_gap_percent",
+            "value": round(avg_gap, 2),
+            "unit": "percentage points",
+            "source_series": list(series_ids),
+        },
+        {
+            "name": "overlap_periods",
+            "value": len(yoy_rows),
+            "unit": "periods",
+            "source_series": list(series_ids),
+        },
+    ],
+    "claims": [
+        {
+            "text": (
+                series_name(left_id, "growth")
+                + " is currently "
+                + direction
+                + " "
+                + series_name(right_id, "growth")
+                + "."
+            ),
+            "metric_refs": ["latest_inflation_gap_percent"],
+        }
+    ],
+    "charts": [
+        {
+            "type": brief_type if brief_type in {"line", "scatter", "bars", "panels"} else "line",
+            "layout": "single",
+            "shared_y_axis": True,
+            "title": title,
+            "x_field": "date",
+            "y_field": [left_field, right_field],
+            "unit": "percent",
+            "y_label": "year-over-year percent",
+            "series_id": ",".join(series_ids),
+            "series_ids": list(series_ids),
+            "y_starts_at_zero": brief_y0,
+            "legend": {
+                left_field: series_name(left_id, "growth"),
+                right_field: series_name(right_id, "growth"),
+            },
+            "data": yoy_rows,
+            "notes": notes,
+        }
+    ],
+    "method_notes": (
+        "Aligned overlapping dates, then computed year-over-year percent changes "
+        "and the gap (first series minus second). Index bases differ, so raw levels "
+        "are not compared on one axis."
+    ),
+    "warnings": [
+        "CPI and PCE use different baskets and index bases; the gap is not a forecast.",
+        "The latest year-over-year reading may use a partial month.",
+    ],
+}
+"""
+
+
+def comparison_draft(analysis: AnalysisArtifact) -> DraftArtifact:
+    metrics_by_name = _metrics_by_name(analysis)
+    left_yoy = metrics_by_name.get("latest_left_yoy_percent", {})
+    right_yoy = metrics_by_name.get("latest_right_yoy_percent", {})
+    gap = metrics_by_name.get("latest_inflation_gap_percent", {})
+    avg_gap = metrics_by_name.get("five_year_average_gap_percent", {})
+    overlap = metrics_by_name.get("overlap_periods", {})
+    source_series = [
+        str(item)
+        for item in gap.get("source_series") or []
+        if item
+    ]
+    if len(source_series) < 2:
+        source_series = [
+            str(metric.get("source_series", [""])[0])
+            for metric in analysis.metrics
+            if isinstance(metric, dict) and metric.get("source_series")
+        ]
+        source_series = [item for item in dict.fromkeys(source_series) if item]
+    left, right = (source_series + ["CPIAUCSL", "PCEPI"])[:2]
+    left_name = plain_series_name(left)
+    right_name = plain_series_name(right)
+    gap_value = gap.get("value")
+    if isinstance(gap_value, (int, float)):
+        rounded_gap = round(float(gap_value), 2)
+        direction = "above" if rounded_gap > 0 else "below" if rounded_gap < 0 else "in line with"
+        abs_gap = abs(rounded_gap)
+        lead = (
+            f"The latest {result_phrase(left)} reading is about {abs_gap} percentage "
+            f"points {direction} {result_phrase(right)} "
+            f"({left_yoy.get('value')}% vs {right_yoy.get('value')}%)."
+        )
+    else:
+        lead = (
+            f"{result_phrase(left)} and {result_phrase(right)} were compared using "
+            "year-over-year percent changes."
+        )
+    avg_bit = ""
+    if isinstance(avg_gap.get("value"), (int, float)):
+        avg_bit = (
+            f" Over the overlapping window the average gap was about "
+            f"{round(float(avg_gap['value']), 2)} percentage points."
+        )
+    overlap_n = overlap.get("value")
+    overlap_bit = (
+        f" over {overlap_n} overlapping periods" if overlap_n is not None else ""
+    )
+    answer = (
+        f"{lead}{avg_bit}\n\n"
+        f"{_sentence_name(left_name)} ({left}) and {right_name} ({right}) "
+        "are the FRED series used here.\n\n"
+        f"The comparison uses year-over-year percent changes{overlap_bit}. "
+        "Different index bases mean raw levels are not compared directly."
+    )
+    return DraftArtifact(
+        answer=answer,
+        referenced_metrics=[
+            name
+            for name in (
+                "latest_inflation_gap_percent",
+                "latest_left_yoy_percent",
+                "latest_right_yoy_percent",
+                "five_year_average_gap_percent",
+                "overlap_periods",
+            )
+            if name in metrics_by_name
+        ],
+        chart_paths=_chart_paths(analysis),
+    )
+
+
 def canonical_cpi_draft(analysis: AnalysisArtifact) -> DraftArtifact:
     metrics_by_name = _metrics_by_name(analysis)
     five_year = metrics_by_name["cpi_five_year_change_percent"]

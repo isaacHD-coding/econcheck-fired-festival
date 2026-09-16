@@ -14,9 +14,7 @@ from workers.artifacts import (
 from workers.base import Worker
 from harness.tools.code_runner import run_analysis_code
 from workers.openai_client import (
-    OPENAI_DESIGN_CHART_TIMEOUT_SECONDS,
     OPENAI_PLAN_TIMEOUT_SECONDS,
-    OPENAI_WRITE_CODE_TIMEOUT_SECONDS,
     OpenAITimeoutError,
 )
 from workers.openai_worker import OpenAIWorker, OpenAIWorkerError, OpenAIWorkerTimeoutError
@@ -137,33 +135,31 @@ def test_openai_worker_passes_stage_specific_timeouts(monkeypatch) -> None:
 
     worker = OpenAIWorker(api_key="test-key")
     state = RunState("openai-timeouts", QUESTION, Stage.PLANNING, 0)
-    plan = worker.plan(QUESTION, state)
-    worker.design_chart(plan, _data_artifact())
-    worker.write_code(plan, _data_artifact())
+    worker.plan(QUESTION, state)
 
     assert captured["planner_artifact"] == OPENAI_PLAN_TIMEOUT_SECONDS
-    assert captured["chart_brief_artifact"] == OPENAI_DESIGN_CHART_TIMEOUT_SECONDS
-    assert captured["code_artifact"] == OPENAI_WRITE_CODE_TIMEOUT_SECONDS
+    assert "chart_brief_artifact" not in captured
+    assert "code_artifact" not in captured
 
 
 def test_openai_worker_timeout_raises_friendly_error(monkeypatch) -> None:
     def fake_call_openai_json(**kwargs):
         raise OpenAITimeoutError(
-            "code_artifact",
-            OPENAI_WRITE_CODE_TIMEOUT_SECONDS,
-            stage_label="write_code",
+            "planner_artifact",
+            OPENAI_PLAN_TIMEOUT_SECONDS,
+            stage_label="plan",
         )
 
     monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
 
     worker = OpenAIWorker(api_key="test-key")
-    with pytest.raises(OpenAIWorkerTimeoutError, match="Code generation took longer than 120") as err:
-        worker.write_code(_planner_artifact(), _data_artifact())
+    with pytest.raises(OpenAIWorkerTimeoutError, match="Planning took longer than 30") as err:
+        worker.plan(QUESTION, RunState("openai-timeout", QUESTION, Stage.PLANNING, 0))
 
     assert "did not match" not in str(err.value)
     assert "OpenAIWorkerError" not in str(err.value)
-    assert err.value.timeout_seconds == OPENAI_WRITE_CODE_TIMEOUT_SECONDS
-    assert err.value.stage_label == "write_code"
+    assert err.value.timeout_seconds == OPENAI_PLAN_TIMEOUT_SECONDS
+    assert err.value.stage_label == "plan"
 
 
 def test_openai_worker_recovers_canonical_cpi_selection_after_empty_model_choice(
@@ -205,14 +201,14 @@ def test_openai_worker_recovers_canonical_cpi_selection_after_empty_model_choice
     assert "canonical CPI" in selection.justification
 
 
-def test_openai_worker_uses_executable_canonical_cpi_code_after_model_call(
+def test_openai_worker_uses_executable_canonical_cpi_template_without_model_call(
     monkeypatch,
 ) -> None:
     calls: list[str] = []
 
     def fake_call_openai_json(*, schema_name, **kwargs):
         calls.append(schema_name)
-        return {"code": "analysis_output = {'tables': {'bad': 'shape'}}"}
+        raise AssertionError("canonical CPI codegen must not call OpenAI")
 
     monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
 
@@ -224,7 +220,7 @@ def test_openai_worker_uses_executable_canonical_cpi_code_after_model_call(
     )
     analysis = run_analysis_code(code, _canonical_cpi_data_artifact())
 
-    assert calls == ["code_artifact"]
+    assert calls == []
     assert analysis.tables
     assert analysis.metrics
     assert analysis.charts
@@ -235,18 +231,14 @@ def test_openai_worker_uses_executable_canonical_cpi_code_after_model_call(
     }
 
 
-def test_openai_worker_uses_grounded_canonical_cpi_draft_after_model_call(
+def test_openai_worker_uses_grounded_canonical_cpi_draft_without_model_call(
     monkeypatch,
 ) -> None:
     calls: list[str] = []
 
     def fake_call_openai_json(*, schema_name, **kwargs):
         calls.append(schema_name)
-        return {
-            "answer": "Prices changed.",
-            "referenced_metrics": [],
-            "chart_paths": [],
-        }
+        raise AssertionError("canonical CPI draft must not call OpenAI")
 
     monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
 
@@ -257,7 +249,7 @@ def test_openai_worker_uses_grounded_canonical_cpi_draft_after_model_call(
         _canonical_cpi_analysis_artifact(),
     )
 
-    assert calls == ["draft_artifact"]
+    assert calls == []
     assert "CPI" in draft.answer
     assert set(draft.referenced_metrics) >= {
         "cpi_five_year_change_percent",
@@ -321,21 +313,11 @@ def test_openai_worker_adds_search_backed_gdp_when_model_selects_only_cpi(
     }
 
 
-def test_openai_worker_replaces_canonical_cpi_code_when_plan_needs_gdp(
+def test_openai_worker_uses_relationship_template_instead_of_canonical_cpi_code(
     monkeypatch,
 ) -> None:
     def fake_call_openai_json(*, schema_name, **kwargs):
-        return {
-            "code": (
-                "rows = sorted(input_data['observations']['CPIAUCSL'], "
-                "key=lambda row: row['date'])\n"
-                "if len(rows) < 48:\n"
-                "    raise RuntimeError('Expected at least 48 CPI observations "
-                "for five-year analysis.')\n"
-                "analysis_output = {'tables': [], 'metrics': [], 'claims': [], "
-                "'charts': [], 'method_notes': 'canned-cpi', 'warnings': []}"
-            )
-        }
+        raise AssertionError(f"unexpected OpenAI call for {schema_name}")
 
     monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
 
@@ -348,24 +330,11 @@ def test_openai_worker_replaces_canonical_cpi_code_when_plan_needs_gdp(
     assert "pearson" in code.code
 
 
-def test_openai_worker_does_not_replace_multiseries_model_code_with_canonical_cpi(
+def test_openai_worker_skips_openai_write_code_for_multiseries_data(
     monkeypatch,
 ) -> None:
-    model_code = (
-        "analysis_output = {"
-        "'tables': [], "
-        "'metrics': [{'name': 'inflation_gdp_correlation', 'value': -0.42, "
-        "'unit': 'correlation', 'source_series': ['CPIAUCSL', 'GDPC1']}], "
-        "'claims': [{'text': 'Inflation and real GDP growth are anti-correlated.', "
-        "'metric_refs': ['inflation_gdp_correlation']}], "
-        "'charts': [{'type': 'line', 'title': 'CPIAUCSL vs GDPC1', 'data': []}], "
-        "'method_notes': 'model-correlation-code', "
-        "'warnings': []}"
-    )
-
     def fake_call_openai_json(*, schema_name, **kwargs):
-        assert schema_name == "code_artifact"
-        return {"code": model_code}
+        raise AssertionError(f"unexpected OpenAI call for {schema_name}")
 
     monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
 
@@ -373,7 +342,7 @@ def test_openai_worker_does_not_replace_multiseries_model_code_with_canonical_cp
     worker.question = ISAAC_QUESTION
     code = worker.write_code(_relationship_plan(), _cpi_and_gdp_data())
 
-    assert "model-correlation-code" in code.code
+    assert "pearson" in code.code
     assert "GDPC1" in code.code
     assert "Expected at least 48 CPI observations" not in code.code
 
@@ -432,16 +401,11 @@ def test_openai_worker_does_not_release_canned_cpi_draft_for_correlation_questio
     assert "growth_correlation" in draft.referenced_metrics
 
 
-def test_openai_worker_keeps_model_correlation_draft(monkeypatch) -> None:
+def test_openai_worker_uses_relationship_draft_template_without_openai(
+    monkeypatch,
+) -> None:
     def fake_call_openai_json(*, schema_name, **kwargs):
-        return {
-            "answer": (
-                "Inflation and real GDP growth are anti-correlated over the window "
-                "based on growth_correlation."
-            ),
-            "referenced_metrics": ["growth_correlation"],
-            "chart_paths": ["analysis.json#charts/0"],
-        }
+        raise AssertionError(f"unexpected OpenAI call for {schema_name}")
 
     monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
 
@@ -465,7 +429,8 @@ def test_openai_worker_keeps_model_correlation_draft(monkeypatch) -> None:
 
     draft = worker.draft_answer(_relationship_plan(), analysis)
 
-    assert "anti-correlated" in draft.answer
+    assert "correlation" in draft.answer.lower()
+    assert "real GDP" in draft.answer
     assert "materially higher" not in draft.answer
 
 
@@ -515,10 +480,9 @@ def test_openai_worker_rewrites_jargony_correlation_draft(monkeypatch) -> None:
     assert "CPI all items" in draft.answer
 
 
-def test_openai_worker_design_chart_falls_back_when_model_json_is_invalid(monkeypatch) -> None:
+def test_openai_worker_design_chart_does_not_call_openai(monkeypatch) -> None:
     def fake_call_openai_json(*, schema_name, **kwargs):
-        assert schema_name == "chart_brief_artifact"
-        return {"claim": "incomplete"}
+        raise AssertionError(f"unexpected OpenAI call for {schema_name}")
 
     monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
 
@@ -530,40 +494,23 @@ def test_openai_worker_design_chart_falls_back_when_model_json_is_invalid(monkey
     assert "growth" in brief.transforms
 
 
-def test_openai_worker_write_code_includes_chart_brief_and_design_advice(monkeypatch) -> None:
-    captured: dict[str, object] = {}
-
-    def fake_call_openai_json(*, schema_name, instructions, input_payload, **kwargs):
-        captured["schema_name"] = schema_name
-        captured["instructions"] = instructions
-        captured["payload"] = input_payload
-        return {
-            "code": (
-                "analysis_output = {"
-                "'tables': [], "
-                "'metrics': [], "
-                "'claims': [], "
-                "'charts': [{'type': 'line', 'title': 'CPIAUCSL vs GDPC1', 'data': []}], "
-                "'method_notes': 'model-correlation-code', "
-                "'warnings': []}"
-            )
-        }
+def test_openai_worker_write_code_attaches_chart_brief_without_openai(
+    monkeypatch,
+) -> None:
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        raise AssertionError(f"unexpected OpenAI call for {schema_name}")
 
     monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
 
     worker = OpenAIWorker(api_key="test-key")
     worker.question = ISAAC_QUESTION
-    brief = worker.design_chart(_relationship_plan(), _cpi_and_gdp_data())
-    worker.write_code(_relationship_plan(), _cpi_and_gdp_data(), chart_brief=brief)
+    data = _cpi_and_gdp_data()
+    brief = worker.design_chart(_relationship_plan(), data)
+    code = worker.write_code(_relationship_plan(), data, chart_brief=brief)
 
-    assert captured["schema_name"] == "code_artifact"
-    instructions = str(captured["instructions"])
-    assert "Follow chart_brief for layout" in instructions
-    assert "dwarf" in instructions.lower()
-    payload = captured["payload"]
-    assert isinstance(payload, dict)
-    assert payload["chart_brief"]["series_ids"] == brief.series_ids
-    assert "growth" in payload["chart_brief"]["transforms"]
+    assert "growth_correlation" in code.code
+    assert data.metadata["chart_brief"]["series_ids"] == brief.series_ids
+    assert "growth" in data.metadata["chart_brief"]["transforms"]
 
 
 def test_relationship_analysis_code_runs_for_cpi_and_gdp() -> None:
@@ -576,7 +523,6 @@ def test_relationship_analysis_code_runs_for_cpi_and_gdp() -> None:
 
     metric_names = {metric["name"] for metric in analysis.metrics}
     assert "growth_correlation" in metric_names
-    assert {metric["name"] for metric in analysis.metrics if metric.get("source_series")}
     source_series = {
         series_id
         for metric in analysis.metrics
@@ -590,6 +536,86 @@ def test_relationship_analysis_code_runs_for_cpi_and_gdp() -> None:
     normalized = normalize_chart(primary)
     assert would_dwarf_a_series(normalized) is False
     assert any("growth" in field for field in y_fields(normalized)) or normalized.get("layout") == "dual_axis"
+
+
+def test_comparison_analysis_code_runs_for_cpi_and_pce() -> None:
+    from workers.analysis_templates import comparison_analysis_code
+
+    analysis = run_analysis_code(
+        CodeArtifact(code=comparison_analysis_code()),
+        _cpi_and_pce_data(),
+    )
+
+    metric_names = {metric["name"] for metric in analysis.metrics}
+    assert "latest_inflation_gap_percent" in metric_names
+    assert {metric["name"] for metric in analysis.metrics if metric.get("source_series")}
+    source_series = {
+        series_id
+        for metric in analysis.metrics
+        for series_id in (metric.get("source_series") or [])
+    }
+    assert source_series >= {"CPIAUCSL", "PCEPI"}
+
+
+CPI_PCE_QUESTION = (
+    "What is the difference between CPI and PCE inflation over the last 5 years?"
+)
+
+
+def test_openai_worker_adds_search_backed_pce_when_model_selects_only_cpi(
+    monkeypatch,
+) -> None:
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        result = _cpi_search_result()
+        result["reason"] = "Inflation"
+        return {
+            "selected_series": [result],
+            "rejected_series": [],
+            "justification": "Model selected CPIAUCSL only.",
+        }
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = CPI_PCE_QUESTION
+    selection = worker.select_data(
+        _comparison_plan(),
+        [_cpi_search_result(), _pce_search_result()],
+    )
+
+    assert {item["series_id"] for item in selection.selected_series} == {
+        "CPIAUCSL",
+        "PCEPI",
+    }
+
+
+def test_openai_worker_uses_comparison_template_without_openai_write_code(
+    monkeypatch,
+) -> None:
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        raise AssertionError(f"unexpected OpenAI call for {schema_name}")
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = CPI_PCE_QUESTION
+    code = worker.write_code(_comparison_plan(), _cpi_and_pce_data())
+
+    assert "latest_inflation_gap_percent" in code.code
+    assert "PCEPI" in code.code
+    assert "pearson" not in code.code
+
+
+def _comparison_plan() -> PlannerArtifact:
+    return PlannerArtifact(
+        question_type="comparison",
+        economic_concepts=["CPI inflation", "PCE inflation"],
+        measurement_strategy="Compare CPIAUCSL and PCEPI year-over-year inflation.",
+        information_requirements=["CPIAUCSL", "PCEPI"],
+        search_queries=["CPIAUCSL", "PCEPI"],
+        required_outputs=["inflation gap"],
+        success_criteria=["Report the CPI-PCE inflation difference"],
+    )
 
 
 def _relationship_plan() -> PlannerArtifact:
@@ -626,6 +652,50 @@ def _gdp_search_result() -> dict:
         "observation_end": "2026-04-01",
         "reason": "",
     }
+
+
+def _pce_search_result() -> dict:
+    return {
+        "series_id": "PCEPI",
+        "title": "Personal Consumption Expenditures: Chain-type Price Index",
+        "frequency": "Monthly",
+        "units": "Index 2017=100",
+        "observation_start": "1959-01-01",
+        "observation_end": "2026-05-01",
+        "reason": "",
+    }
+
+
+def _cpi_and_pce_data() -> DataArtifact:
+    cpi_rows = []
+    pce_rows = []
+    cpi_value = 260.0
+    pce_value = 100.0
+    for year in range(2021, 2027):
+        for month in range(1, 13):
+            if year == 2026 and month > 4:
+                break
+            cpi_rows.append(
+                {
+                    "series_id": "CPIAUCSL",
+                    "date": f"{year}-{month:02d}-01",
+                    "value": round(cpi_value, 3),
+                }
+            )
+            pce_rows.append(
+                {
+                    "series_id": "PCEPI",
+                    "date": f"{year}-{month:02d}-01",
+                    "value": round(pce_value, 3),
+                }
+            )
+            cpi_value += 0.8
+            pce_value += 0.4
+    return DataArtifact(
+        series_ids=["CPIAUCSL", "PCEPI"],
+        observations={"CPIAUCSL": cpi_rows, "PCEPI": pce_rows},
+        metadata={"source": "FRED"},
+    )
 
 
 def _cpi_and_gdp_data() -> DataArtifact:

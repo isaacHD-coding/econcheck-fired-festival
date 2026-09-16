@@ -324,6 +324,207 @@ def test_openai_mode_correlation_question_does_not_release_canned_cpi(
     assert "Expected at least 48 CPI observations" not in generated
 
 
+CPI_PCE_QUESTION = (
+    "What is the difference between CPI and PCE inflation over the last 5 years?"
+)
+
+
+def test_mocked_cpi_pce_difference_releases_without_canned_cpi(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(orchestrator_module, "fred_search", _search_cpi_and_pce)
+    monkeypatch.setattr(orchestrator_module, "fred_fetch", _fetch_cpi_and_pce)
+
+    state = RunState("cpi-pce-mock", CPI_PCE_QUESTION, Stage.INPUT, 0)
+    orchestrator = Orchestrator(
+        state,
+        runs_dir=tmp_path,
+        worker=MockWorker(),
+        checker=MockChecker(),
+        fred_api_key="judge-key",
+    )
+    final_state = orchestrator.run()
+
+    assert final_state.current_stage is Stage.RELEASED
+    assert orchestrator._write_code_attempts == 1
+    assert final_state.retry_count == 0
+    final_answer = json.loads((tmp_path / "cpi-pce-mock" / "final_answer.json").read_text())
+    selected = json.loads((tmp_path / "cpi-pce-mock" / "selected_data.json").read_text())
+    selected_ids = {item["series_id"] for item in selected["selected_series"]}
+    assert selected_ids == {"CPIAUCSL", "PCEPI"}
+    assert "PCE" in final_answer["answer"] or "pce" in final_answer["answer"].lower()
+    assert "materially higher" not in final_answer["answer"]
+
+
+def test_openai_cpi_pce_path_does_not_loop_write_code(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from workers.openai_checker import OpenAIChecker
+    from workers.openai_worker import OpenAIWorker
+
+    schema_calls: list[str] = []
+    responses = {
+        "planner_artifact": {
+            "question_type": "trend",
+            "economic_concepts": ["inflation"],
+            "measurement_strategy": "Look at CPI only.",
+            "information_requirements": ["CPIAUCSL"],
+            "search_queries": ["CPIAUCSL"],
+            "required_outputs": ["five-year CPI change"],
+            "success_criteria": ["Answer cites CPI"],
+        },
+        "data_selection_artifact": {
+            "selected_series": [
+                {
+                    "series_id": "CPIAUCSL",
+                    "title": "CPI",
+                    "frequency": "Monthly",
+                    "units": "Index",
+                    "observation_start": "1947-01-01",
+                    "observation_end": "2026-08-01",
+                    "reason": "Inflation",
+                }
+            ],
+            "rejected_series": [],
+            "justification": "Model collapsed to CPI.",
+        },
+        "code_artifact": {
+            "code": "raise RuntimeError('model codegen should not run')",
+        },
+        "draft_artifact": {
+            "answer": "Over the last five years, CPI inflation has left the CPI index materially higher.",
+            "referenced_metrics": ["cpi_five_year_change_percent"],
+            "chart_paths": [],
+        },
+        "checker_artifact": {
+            "passed": True,
+            "issues": [],
+            "retry_from": "",
+            "explanation": "Grounded CPI vs PCE comparison.",
+        },
+        "chart_brief_artifact": {
+            "claim": "should not be requested",
+            "series_ids": ["CPIAUCSL"],
+            "transforms": ["levels"],
+            "layout": "single",
+            "y_starts_at_zero": False,
+            "time_window_rationale": "n/a",
+            "annotations": [],
+            "title": "CPI",
+            "x_label": "date",
+            "y_label": "index",
+            "units": "index",
+            "notes": "n/a",
+            "chart_type": "line",
+            "y_left_label": "",
+            "y_right_label": "",
+            "design_notes": "",
+        },
+    }
+
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        schema_calls.append(schema_name)
+        if schema_name in {"code_artifact", "chart_brief_artifact", "draft_artifact"}:
+            raise AssertionError(f"expensive OpenAI stage should be skipped: {schema_name}")
+        return responses[schema_name]
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+    monkeypatch.setattr("workers.openai_checker.call_openai_json", fake_call_openai_json)
+    monkeypatch.setattr(orchestrator_module, "fred_search", _search_cpi_and_pce)
+    monkeypatch.setattr(orchestrator_module, "fred_fetch", _fetch_cpi_and_pce)
+
+    state = RunState(
+        "cpi-pce-openai",
+        CPI_PCE_QUESTION,
+        Stage.INPUT,
+        0,
+        max_turns=3,
+    )
+    orchestrator = Orchestrator(
+        state,
+        runs_dir=tmp_path,
+        worker=OpenAIWorker(api_key="test-key"),
+        checker=OpenAIChecker(api_key="test-key"),
+        fred_api_key="judge-key",
+        deadline_seconds=180,
+    )
+    final_state = orchestrator.run()
+
+    assert final_state.current_stage is Stage.RELEASED
+    assert orchestrator._write_code_attempts == 1
+    assert orchestrator._write_code_attempts <= state.max_turns
+    assert final_state.retry_count == 0
+    assert schema_calls.count("code_artifact") == 0
+    assert schema_calls.count("chart_brief_artifact") == 0
+    assert "planner_artifact" in schema_calls
+    final_answer = json.loads((tmp_path / "cpi-pce-openai" / "final_answer.json").read_text())
+    assert "materially higher" not in final_answer["answer"]
+    assert "PCE" in final_answer["answer"] or "pce" in final_answer["answer"].lower()
+
+
+def test_write_code_failures_stop_at_max_turns(monkeypatch, tmp_path: Path) -> None:
+    class BrokenCode(MockWorker):
+        def write_code(self, plan, data, chart_brief=None):
+            from workers.artifacts import CodeArtifact
+
+            return CodeArtifact(code="raise RuntimeError('forced codegen failure')")
+
+    monkeypatch.setattr(orchestrator_module, "fred_search", _search_cpi_and_pce)
+    monkeypatch.setattr(orchestrator_module, "fred_fetch", _fetch_cpi_and_pce)
+
+    max_turns = 2
+    state = RunState(
+        "codegen-loop",
+        CPI_PCE_QUESTION,
+        Stage.INPUT,
+        0,
+        max_turns=max_turns,
+    )
+    orchestrator = Orchestrator(
+        state,
+        runs_dir=tmp_path,
+        worker=BrokenCode(),
+        checker=MockChecker(),
+        fred_api_key="judge-key",
+        deadline_seconds=None,
+    )
+    final_state = orchestrator.run()
+
+    assert final_state.current_stage is Stage.ESCALATED
+    assert orchestrator._write_code_attempts <= max_turns + 1
+    assert final_state.retry_count > max_turns
+
+
+def _search_cpi_and_pce(query: str, *, api_key: str | None = None):
+    query_l = query.lower()
+    if "pce" in query_l or "pcepi" in query_l or "personal consumption" in query_l:
+        series_id, title = "PCEPI", "Personal Consumption Expenditures Price Index"
+        freq, units = "Monthly", "Index 2017=100"
+    else:
+        series_id, title = "CPIAUCSL", "CPI All Items"
+        freq, units = "Monthly", "Index 1982-1984=100"
+    return [
+        SeriesSearchResult(
+            series_id=series_id,
+            title=title,
+            frequency=freq,
+            units=units,
+            observation_start="1947-01-01",
+            observation_end="2026-08-01",
+        )
+    ]
+
+
+def _fetch_cpi_and_pce(series_ids, *, api_key=None, observation_start=None):
+    return DataArtifact(
+        series_ids=list(series_ids),
+        observations={series_id: _fresh_rows(series_id) for series_id in series_ids},
+        metadata={"source": "FRED", "series": {}},
+    )
+
+
 def _fresh_gdp_rows() -> list[dict[str, object]]:
     rows = []
     today = date.today()

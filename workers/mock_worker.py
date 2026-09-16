@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from harness.domain import is_cpi_question, is_relationship_question
+from harness.domain import is_comparison_question, is_cpi_question, is_relationship_question
 from harness.state import RunState
-from workers.analysis_templates import relationship_analysis_code, relationship_draft
+from workers.analysis_templates import (
+    comparison_analysis_code,
+    comparison_draft,
+    relationship_analysis_code,
+    relationship_draft,
+)
 from workers.artifacts import (
     AnalysisArtifact,
     ChartBriefArtifact,
@@ -26,6 +31,34 @@ class MockWorker:
         state: RunState,
     ) -> PlannerArtifact:
         self.question = question
+        if is_comparison_question(question):
+            return PlannerArtifact(
+                question_type="comparison",
+                economic_concepts=["CPI inflation", "PCE inflation"],
+                measurement_strategy=(
+                    "Search FRED for CPIAUCSL and PCEPI, align overlapping months, "
+                    "and compare year-over-year inflation rates and their gap."
+                ),
+                information_requirements=[
+                    "FRED CPIAUCSL observations",
+                    "FRED PCEPI observations",
+                    "overlapping dates for a year-over-year comparison",
+                ],
+                search_queries=[
+                    "Consumer Price Index for All Urban Consumers All Items CPIAUCSL",
+                    "Personal Consumption Expenditures Chain-type Price Index PCEPI",
+                ],
+                required_outputs=[
+                    "latest CPI and PCE year-over-year inflation",
+                    "inflation gap",
+                    "aligned dual-series YoY chart",
+                ],
+                success_criteria=[
+                    "Answer reports the CPI–PCE inflation difference",
+                    "Answer cites generated metric names",
+                    "Answer notes that index bases differ",
+                ],
+            )
         if is_relationship_question(question):
             return PlannerArtifact(
                 question_type="relationship",
@@ -173,6 +206,8 @@ class MockWorker:
             question=getattr(self, "question", ""),
         )
         _attach_chart_brief(data_summary, brief)
+        if is_comparison_question(getattr(self, "question", "")) and len(series_ids) > 1:
+            return CodeArtifact(code=comparison_analysis_code())
         if len(series_ids) > 1:
             return CodeArtifact(code=relationship_analysis_code())
         series_id = series_ids[0] if series_ids else "CPIAUCSL"
@@ -188,6 +223,8 @@ class MockWorker:
             for metric in analysis.metrics
             if isinstance(metric, dict) and isinstance(metric.get("name"), str)
         ]
+        if any(name == "latest_inflation_gap_percent" for name in referenced_metrics):
+            return comparison_draft(analysis)
         if any(name == "growth_correlation" for name in referenced_metrics):
             return relationship_draft(analysis)
         metrics_by_name = {
@@ -246,6 +283,23 @@ def _select_series_list(
     question: str,
 ) -> list[dict]:
     if not search_results:
+        return []
+
+    if is_comparison_question(question) or plan.question_type == "comparison":
+        selected: list[dict] = []
+        for series_id in ("CPIAUCSL", "PCEPI"):
+            match = next(
+                (dict(item) for item in search_results if item.get("series_id") == series_id),
+                None,
+            )
+            if match is None:
+                continue
+            match["reason"] = match.get("reason") or (
+                f"{series_id} is present in FRED search results and needed for the comparison."
+            )
+            selected.append(match)
+        if selected:
+            return selected
         return []
 
     if is_relationship_question(question) or plan.question_type == "relationship":

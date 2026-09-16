@@ -7,7 +7,11 @@ from datetime import date, datetime
 from typing import Any
 
 from harness.checkpoints.base import CheckpointResult
-from harness.domain import is_cpi_question, is_relationship_question
+from harness.domain import (
+    is_comparison_question,
+    is_cpi_question,
+    is_relationship_question,
+)
 
 
 class SourceProvenanceCheckpoint:
@@ -183,13 +187,13 @@ class InformationSufficiencyCheckpoint:
         if not isinstance(observations, dict):
             observations = {}
 
-        if is_cpi_question(question):
-            passed = "CPIAUCSL" in ids and bool(observations.get("CPIAUCSL"))
-            message = "CPIAUCSL observations are required for CPI/inflation questions."
-        elif is_relationship_question(question):
+        if is_comparison_question(question) or is_relationship_question(question):
             present = [series_id for series_id in ids if observations.get(series_id)]
             passed = len(present) >= 2
-            message = "Relationship questions require at least two fetched FRED series."
+            message = "Comparison and relationship questions require at least two fetched FRED series."
+        elif is_cpi_question(question):
+            passed = "CPIAUCSL" in ids and bool(observations.get("CPIAUCSL"))
+            message = "CPIAUCSL observations are required for CPI/inflation questions."
         else:
             passed = bool(ids) and all(observations.get(series_id) for series_id in ids)
             message = "Selected FRED series must include fetched observations."

@@ -107,6 +107,7 @@ class Orchestrator:
         self._loop_iterations = 0
         self._max_loop_iterations = max(8, (state.max_turns + 1) * 8)
         self._timeout_retries: dict[str, int] = {}
+        self._write_code_attempts = 0
         self._checks: list[dict[str, Any]] = []
         self._guardrails: list[dict[str, Any]] = []
         self._timeline: list[dict[str, Any]] = []
@@ -717,7 +718,9 @@ class Orchestrator:
         if "chart_brief" in parameters or any(
             param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
         ):
+            self._write_code_attempts += 1
             return method(plan, data, chart_brief=chart_brief)
+        self._write_code_attempts += 1
         return method(plan, data)
 
     def _run_answer_checks(

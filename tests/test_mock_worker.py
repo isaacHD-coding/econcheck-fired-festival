@@ -139,6 +139,35 @@ class MockWorkerTests(unittest.TestCase):
         )
         self.assertEqual(empty_selection.selected_series, [])
 
+    def test_cpi_pce_question_plans_and_selects_both_inflation_series(self) -> None:
+        question = (
+            "What is the difference between CPI and PCE inflation over the last 5 years?"
+        )
+        plan = self.worker.plan(question, self.state)
+        selection = self.worker.select_data(
+            plan,
+            [
+                {
+                    "series_id": "CPIAUCSL",
+                    "title": "Consumer Price Index for All Urban Consumers",
+                    "frequency": "Monthly",
+                    "units": "Index 1982-1984=100",
+                },
+                {
+                    "series_id": "PCEPI",
+                    "title": "Personal Consumption Expenditures Chain-type Price Index",
+                    "frequency": "Monthly",
+                    "units": "Index 2017=100",
+                },
+            ],
+        )
+
+        self.assertEqual(plan.question_type, "comparison")
+        self.assertEqual(
+            {item["series_id"] for item in selection.selected_series},
+            {"CPIAUCSL", "PCEPI"},
+        )
+
     def test_relationship_design_chart_covers_fetched_series(self) -> None:
         question = (
             "What is the correlation (or anti correlation) between inflation "
