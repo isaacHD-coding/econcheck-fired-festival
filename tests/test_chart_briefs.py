@@ -79,8 +79,11 @@ def test_build_chart_brief_for_correlation_uses_growth_overlay() -> None:
     assert brief.chart_type == "line"
     assert brief.y_starts_at_zero is False
     assert "percent" in brief.units.lower()
-    assert "CPIAUCSL" in brief.title and "GDPC1" in brief.title
-    assert "align" in brief.notes.lower() or "carried-forward" in brief.notes.lower()
+    assert "CPI growth" in brief.title
+    assert "Real GDP growth" in brief.title
+    assert "align" in brief.notes.lower()
+    assert "Do not place incompatible" not in brief.notes
+    assert "Do not place incompatible" in brief.design_notes
 
 
 def test_build_chart_brief_does_not_invent_unfetched_series() -> None:
@@ -135,6 +138,48 @@ def test_relationship_codegen_follows_brief_and_passes_guardrails() -> None:
     assert primary.get("unit") or primary.get("y_label")
     assert primary.get("series_id") or primary.get("series_ids")
     assert any("growth" in field for field in y_fields(primary)) or primary.get("layout") == "dual_axis"
+    for chart in labeled.charts:
+        notes = str(chart.get("notes") or "")
+        assert "Do not place incompatible raw levels" not in notes
+        assert not notes.lower().startswith("do not ")
+
+
+def test_relationship_draft_explains_series_in_plain_english() -> None:
+    from workers.analysis_templates import relationship_draft
+
+    analysis = AnalysisArtifact(
+        tables=[],
+        metrics=[
+            {
+                "name": "growth_correlation",
+                "value": -0.4625,
+                "unit": "correlation",
+                "source_series": ["CPIAUCSL", "GDPC1"],
+            },
+            {
+                "name": "overlap_periods",
+                "value": 18,
+                "unit": "periods",
+                "source_series": ["CPIAUCSL", "GDPC1"],
+            },
+        ],
+        claims=[],
+        charts=[{"type": "line", "notes": "Percent change after aligning mixed frequencies."}],
+        method_notes="test",
+        warnings=[],
+    )
+    draft = relationship_draft(analysis)
+    text = draft.answer.lower()
+    assert text.startswith("over this window")
+    assert "inflation" in text
+    assert "real gdp" in text
+    assert "cpi all items" in text
+    assert "cpiaucsl" in text
+    assert "gdpc1" in text
+    assert "contemporaneous association" not in text
+    assert "moved opposite" in text
+    ids_only = "cpiaucsl" in text and "gdpc1" in text and "cpi all" not in text and "real gdp" not in text
+    assert ids_only is False
 
 
 def test_chart_honesty_prefers_retry_over_releasing_dwarf_chart() -> None:
@@ -233,5 +278,70 @@ def test_render_honors_stacked_brief_layout() -> None:
     line_calls = [item for item in fake.calls if item[0] == "line_chart"]
     assert len(line_calls) >= 2
     plotted = {call[2].get("y") for call in line_calls}
-    assert "CPIAUCSL" in plotted
-    assert "GDPC1" in plotted
+    assert "CPI all items" in plotted
+    assert "Real GDP" in plotted
+    assert "CPIAUCSL" not in plotted
+    assert "GDPC1" not in plotted
+
+
+def test_render_hides_instruction_notes_and_uses_human_legend() -> None:
+    from harness.charts import public_chart_notes, render_charts
+
+    class FakeST:
+        def __init__(self) -> None:
+            self.calls: list[tuple] = []
+
+        def markdown(self, *args, **kwargs) -> None:
+            self.calls.append(("markdown", args, kwargs))
+
+        def caption(self, *args, **kwargs) -> None:
+            self.calls.append(("caption", args, kwargs))
+
+        def line_chart(self, *args, **kwargs) -> None:
+            self.calls.append(("line_chart", args, kwargs))
+
+        def altair_chart(self, *args, **kwargs) -> None:
+            self.calls.append(("altair_chart", args, kwargs))
+
+        def expander(self, *args, **kwargs):
+            from contextlib import contextmanager
+
+            @contextmanager
+            def _cm():
+                yield self
+
+            return _cm()
+
+        def json(self, *args, **kwargs) -> None:
+            self.calls.append(("json", args, kwargs))
+
+        def info(self, *args, **kwargs) -> None:
+            self.calls.append(("info", args, kwargs))
+
+    chart = {
+        "type": "line",
+        "layout": "single",
+        "title": "CPI growth vs Real GDP growth",
+        "x_field": "date",
+        "y_field": ["CPIAUCSL_growth", "GDPC1_growth"],
+        "unit": "percent",
+        "series_ids": ["CPIAUCSL", "GDPC1"],
+        "notes": (
+            "Align mixed frequencies with last-observation-carried-forward onto the "
+            "lower-frequency dates. Do not place incompatible raw levels on one shared "
+            "y-axis; if a levels companion is shown, use dual-axis or stacked panels."
+        ),
+        "data": [
+            {"date": "2021-04-01", "CPIAUCSL_growth": 1.2, "GDPC1_growth": 0.4},
+            {"date": "2021-07-01", "CPIAUCSL_growth": 0.8, "GDPC1_growth": -0.2},
+        ],
+    }
+    assert "Do not place incompatible raw levels" not in public_chart_notes(chart)
+    fake = FakeST()
+    render_charts(fake, [chart])
+    captions = " ".join(str(call[1][0]) for call in fake.calls if call[0] == "caption")
+    assert "Do not place incompatible raw levels" not in captions
+    line_calls = [item for item in fake.calls if item[0] == "line_chart"]
+    assert line_calls
+    y = line_calls[0][2].get("y")
+    assert y == ["CPI growth", "Real GDP growth"]

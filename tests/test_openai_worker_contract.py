@@ -344,6 +344,9 @@ def test_openai_worker_does_not_release_canned_cpi_draft_for_correlation_questio
     assert "materially higher" not in draft.answer
     assert "correlation" in draft.answer.lower()
     assert "GDPC1" in draft.answer
+    assert "CPI all items" in draft.answer or "inflation" in draft.answer.lower()
+    assert "real GDP" in draft.answer
+    assert "contemporaneous association" not in draft.answer.lower()
     assert "growth_correlation" in draft.referenced_metrics
 
 
@@ -382,6 +385,52 @@ def test_openai_worker_keeps_model_correlation_draft(monkeypatch) -> None:
 
     assert "anti-correlated" in draft.answer
     assert "materially higher" not in draft.answer
+
+
+def test_openai_worker_rewrites_jargony_correlation_draft(monkeypatch) -> None:
+    def fake_call_openai_json(*, schema_name, **kwargs):
+        return {
+            "answer": (
+                "Over the overlapping FRED window, period-over-period growth in "
+                "CPIAUCSL and GDPC1 is anti-correlated (negative contemporaneous "
+                "association). This does not by itself identify lead-lag."
+            ),
+            "referenced_metrics": ["growth_correlation"],
+            "chart_paths": ["analysis.json#charts/0"],
+        }
+
+    monkeypatch.setattr("workers.openai_worker.call_openai_json", fake_call_openai_json)
+
+    worker = OpenAIWorker(api_key="test-key")
+    worker.question = ISAAC_QUESTION
+    analysis = AnalysisArtifact(
+        tables=[],
+        metrics=[
+            {
+                "name": "growth_correlation",
+                "value": -0.46,
+                "unit": "correlation",
+                "source_series": ["CPIAUCSL", "GDPC1"],
+            },
+            {
+                "name": "overlap_periods",
+                "value": 18,
+                "unit": "periods",
+                "source_series": ["CPIAUCSL", "GDPC1"],
+            },
+        ],
+        claims=[],
+        charts=[{"type": "line", "data": []}],
+        method_notes="model",
+        warnings=[],
+    )
+
+    draft = worker.draft_answer(_relationship_plan(), analysis)
+
+    assert "contemporaneous association" not in draft.answer.lower()
+    assert "inflation" in draft.answer.lower()
+    assert "real GDP" in draft.answer
+    assert "CPI all items" in draft.answer
 
 
 def test_openai_worker_design_chart_falls_back_when_model_json_is_invalid(monkeypatch) -> None:
@@ -427,7 +476,7 @@ def test_openai_worker_write_code_includes_chart_brief_and_design_advice(monkeyp
 
     assert captured["schema_name"] == "code_artifact"
     instructions = str(captured["instructions"])
-    assert "Follow chart_brief exactly" in instructions
+    assert "Follow chart_brief for layout" in instructions
     assert "dwarf" in instructions.lower()
     payload = captured["payload"]
     assert isinstance(payload, dict)

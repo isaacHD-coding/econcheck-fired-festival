@@ -158,8 +158,9 @@ class MockWorkerTests(unittest.TestCase):
         self.assertIn("growth", brief.transforms)
         self.assertEqual(brief.layout, "single")
         self.assertFalse(brief.y_starts_at_zero)
-        self.assertIn("CPIAUCSL", brief.title)
-        self.assertIn("GDPC1", brief.title)
+        self.assertIn("CPI growth", brief.title)
+        self.assertIn("Real GDP growth", brief.title)
+        self.assertNotIn("Do not place incompatible", brief.notes)
 
 
 if __name__ == "__main__":

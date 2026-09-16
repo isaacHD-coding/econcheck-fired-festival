@@ -16,7 +16,7 @@ from workers.artifacts import (
     DraftArtifact,
     PlannerArtifact,
 )
-from workers.chart_briefs import build_chart_brief
+from workers.chart_briefs import build_chart_brief, is_instruction_note
 
 
 class MockWorker:
@@ -342,6 +342,8 @@ def _single_series_analysis_code(
         title = chart_brief.title.replace('"', "'")
         y_label = chart_brief.y_label.replace('"', "'")
         notes = chart_brief.notes.replace('"', "'")
+        if is_instruction_note(notes):
+            notes = f"{series_id} over the fetched window."
         chart_type = chart_brief.chart_type
         y_starts_at_zero = chart_brief.y_starts_at_zero
         layout = chart_brief.layout

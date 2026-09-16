@@ -156,6 +156,7 @@ class ChartBriefArtifact:
     chart_type: str
     y_left_label: str = ""
     y_right_label: str = ""
+    design_notes: str = ""
 
     def __post_init__(self) -> None:
         _require_non_empty_string("claim", self.claim)
@@ -195,6 +196,7 @@ class ChartBriefArtifact:
             raise ArtifactValidationError(f"chart_type must be one of: {allowed}")
         _require_string("y_left_label", self.y_left_label)
         _require_string("y_right_label", self.y_right_label)
+        _require_string("design_notes", self.design_notes)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -213,6 +215,7 @@ class ChartBriefArtifact:
             "chart_type": self.chart_type,
             "y_left_label": self.y_left_label,
             "y_right_label": self.y_right_label,
+            "design_notes": self.design_notes,
         }
 
     @classmethod
@@ -234,6 +237,7 @@ class ChartBriefArtifact:
             chart_type=_required(data, "chart_type"),
             y_left_label=data.get("y_left_label") or "",
             y_right_label=data.get("y_right_label") or "",
+            design_notes=data.get("design_notes") or "",
         )
 
 

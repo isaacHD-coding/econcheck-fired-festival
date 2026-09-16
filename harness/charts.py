@@ -5,6 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from workers.artifacts import AnalysisArtifact, ChartBriefArtifact
+from workers.chart_briefs import (
+    humanize_field_name,
+    is_instruction_note,
+    user_facing_chart_notes,
+)
 
 
 SCALE_RATIO_THRESHOLD = 10.0
@@ -80,6 +85,7 @@ def normalize_chart(
     """Rewrite mixed-scale single-axis overlays into a dual-axis or stacked descriptor."""
 
     normalized = apply_chart_brief(chart, brief)
+    normalized = _sanitize_chart_copy(normalized)
     fields = y_fields(normalized)
     if len(fields) < 2:
         normalized.setdefault("layout", "single")
@@ -119,7 +125,7 @@ def apply_chart_brief(
         normalized["type"] = payload["chart_type"]
     if "y_starts_at_zero" not in normalized and "y_starts_at_zero" in payload:
         normalized["y_starts_at_zero"] = bool(payload["y_starts_at_zero"])
-    if payload.get("notes") and not normalized.get("notes"):
+    if payload.get("notes") and not normalized.get("notes") and not is_instruction_note(payload.get("notes") or ""):
         normalized["notes"] = payload["notes"]
     if payload.get("series_ids") and not normalized.get("series_id") and not normalized.get("series_ids"):
         series_ids = [str(item) for item in payload["series_ids"] if item]
@@ -164,9 +170,9 @@ def render_charts(st: Any, charts: Any) -> None:
 
 def _render_one_chart(st: Any, chart: dict[str, Any], *, index: int) -> None:
     st.markdown(f"**{chart.get('title', f'Chart {index + 1}')}**")
-    notes = chart.get("notes") or chart.get("method_notes")
+    notes = public_chart_notes(chart)
     if notes:
-        st.caption(str(notes))
+        st.caption(notes)
 
     data = chart.get("data") or []
     if not data:
@@ -177,15 +183,26 @@ def _render_one_chart(st: Any, chart: dict[str, Any], *, index: int) -> None:
     layout = _layout_name(chart)
     x_field = str(chart.get("x_field") or chart.get("x") or "date")
     fields = y_fields(chart)
+    display_data, display_fields, labels = _display_series(chart, data, fields)
 
     if layout == "dual_axis" and len(fields) >= 2:
-        if not _render_dual_axis(st, chart, data, x_field, fields):
-            _render_stacked(st, chart, data, x_field, fields)
+        labeled = dict(chart)
+        labeled["y_left"] = display_fields[0]
+        labeled["y_right"] = display_fields[1]
+        labeled["y_left_label"] = labels.get(fields[0], display_fields[0])
+        labeled["y_right_label"] = labels.get(fields[1], display_fields[1])
+        if not _render_dual_axis(st, labeled, display_data, x_field, display_fields):
+            _render_stacked(st, labeled, display_data, x_field, display_fields)
     elif layout in {"stacked", "panels"} and len(fields) >= 2:
-        _render_stacked(st, chart, data, x_field, fields)
+        labeled = dict(chart)
+        labeled["y_left"] = display_fields[0]
+        labeled["y_right"] = display_fields[1]
+        labeled["y_left_label"] = labels.get(fields[0], display_fields[0])
+        labeled["y_right_label"] = labels.get(fields[1], display_fields[1])
+        _render_stacked(st, labeled, display_data, x_field, display_fields)
     else:
-        y = fields if len(fields) > 1 else fields[0]
-        st.line_chart(data, x=x_field, y=y, width="stretch")
+        y = display_fields if len(display_fields) > 1 else display_fields[0]
+        st.line_chart(display_data, x=x_field, y=y, width="stretch")
 
     with st.expander("Chart artifact JSON"):
         st.json(chart)
@@ -270,6 +287,53 @@ def _brief_payload(
     if isinstance(brief, dict):
         return dict(brief)
     return {}
+
+
+def public_chart_notes(chart: dict[str, Any]) -> str:
+    raw = str(chart.get("notes") or chart.get("caption") or "")
+    cleaned = user_facing_chart_notes(raw)
+    if cleaned:
+        return cleaned
+    unit = str(chart.get("unit") or chart.get("y_label") or "").strip()
+    if unit:
+        return f"Units: {unit}."
+    return ""
+
+
+def _sanitize_chart_copy(chart: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(chart)
+    notes = public_chart_notes(cleaned)
+    if notes:
+        cleaned["notes"] = notes
+    elif is_instruction_note(str(cleaned.get("notes") or "")):
+        cleaned["notes"] = public_chart_notes({**cleaned, "notes": ""})
+    if not cleaned.get("legend"):
+        cleaned["legend"] = {
+            field: humanize_field_name(field) for field in y_fields(cleaned)
+        }
+    return cleaned
+
+
+def _display_series(
+    chart: dict[str, Any],
+    data: list[dict[str, Any]],
+    fields: list[str],
+) -> tuple[list[dict[str, Any]], list[str], dict[str, str]]:
+    legend = chart.get("legend") if isinstance(chart.get("legend"), dict) else {}
+    labels = {}
+    for field in fields:
+        label = str(legend.get(field) or humanize_field_name(field) or field)
+        labels[field] = label
+    display_fields = [labels[field] for field in fields]
+    display_data = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        item = {}
+        for key, value in row.items():
+            item[labels.get(key, key)] = value
+        display_data.append(item)
+    return display_data, display_fields, labels
 
 
 def _chart_matches_brief_transform(chart: dict[str, Any], payload: dict[str, Any]) -> bool:

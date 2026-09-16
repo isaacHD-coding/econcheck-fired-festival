@@ -14,7 +14,9 @@ from harness.state import RunState
 from workers.analysis_templates import (
     canonical_cpi_analysis_code,
     canonical_cpi_draft,
+    draft_uses_plain_series_names,
     looks_like_canned_cpi_draft,
+    looks_like_jargony_relationship_draft,
     relationship_analysis_code,
     relationship_draft,
 )
@@ -198,11 +200,11 @@ class OpenAIWorker:
                     "relationship among those series (aligned growth-rate correlation "
                     "is acceptable) instead of a CPI-only five-year trend. "
                     + CHART_DESIGN_ADVICE
-                    + " Follow chart_brief exactly: claim, series_ids, transforms, "
-                    "layout (single|dual_axis|stacked), y_starts_at_zero, title, "
-                    "axis labels/units, notes, and chart_type. Every multi-series "
-                    "chart must label units and cite FRED series ids. Never overlay "
-                    "raw series with incompatible scales on one shared y-axis."
+                    + " Follow chart_brief for layout and transforms. User-facing "
+                    "chart titles, legends, and notes must be plain English "
+                    "('CPI growth', 'Real GDP growth'). Chart notes are a short "
+                    "caption (units, alignment, n) only. Never put 'Do not…' harness "
+                    "design rules in analysis.charts notes."
                 ),
             ),
             input_payload=payload,
@@ -240,7 +242,14 @@ class OpenAIWorker:
                     "as analysis.json#charts/{index} when charts are available. "
                     "Answer the user's actual question. If the analysis includes a "
                     "relationship or correlation metric, explain that relationship; "
-                    "do not replace it with a CPI-only five-year paragraph."
+                    "do not replace it with a CPI-only five-year paragraph. "
+                    "Write for a non-specialist: lead with the result in one clear "
+                    "sentence (what moved together or opposite, and the correlation). "
+                    "Immediately explain the series in plain English with FRED ids in "
+                    "parentheses once (CPI all items / real GDP). Then one short method "
+                    "clause (aligned period-over-period growth, n periods) and one short "
+                    "caveat (not causal; not a full lead-lag study). Do not open with "
+                    "jargon such as contemporaneous association or lead-lag."
                 ),
             ),
             input_payload=payload,
@@ -250,7 +259,10 @@ class OpenAIWorker:
         if _allow_canonical_cpi_fallback(self.question, plan, analysis) and _is_canonical_cpi_analysis(analysis):
             return canonical_cpi_draft(analysis)
         if _is_relationship_analysis(analysis) and (
-            looks_like_canned_cpi_draft(draft) or not _draft_mentions_relationship(draft)
+            looks_like_canned_cpi_draft(draft)
+            or not _draft_mentions_relationship(draft)
+            or looks_like_jargony_relationship_draft(draft)
+            or not draft_uses_plain_series_names(draft, analysis)
         ):
             return relationship_draft(analysis)
         return draft
@@ -643,6 +655,7 @@ CHART_BRIEF_SCHEMA: dict[str, Any] = {
         "chart_type": {"type": "string"},
         "y_left_label": {"type": "string"},
         "y_right_label": {"type": "string"},
+        "design_notes": {"type": "string"},
     },
     "required": [
         "claim",
@@ -660,6 +673,7 @@ CHART_BRIEF_SCHEMA: dict[str, Any] = {
         "chart_type",
         "y_left_label",
         "y_right_label",
+        "design_notes",
     ],
 }
 

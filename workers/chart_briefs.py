@@ -24,9 +24,50 @@ Adaptive chart design (follow before drawing):
 - Provenance: cite FRED ids, units, and overlap n in notes when reporting correlation.
 - Chart type must fit the claim (line for co-movement over time, scatter for pairwise
   association, bars for discrete nonnegative levels, panels for small multiples).
-- Title and legend in plain English plus the series id (for example
-  "CPI all items (CPIAUCSL)").
+- Title and legend in plain English (for example "CPI growth", "Real GDP growth"),
+  not raw variable names like CPIAUCSL_growth.
+- User-facing chart notes/captions must be a short plain explanation of what is
+  plotted: units, alignment, and sample size n. Never put harness design rules
+  or sentences that start with "Do not…" in chart notes, titles, or legends.
+  Put those rules in design_notes for observability only.
 """.strip()
+
+INSTRUCTION_NOTE_PHRASES = (
+    "do not place incompatible",
+    "do not force y",
+    "if a levels companion",
+    "use dual-axis or stacked",
+    "follow the chart brief",
+    "never invent",
+    "codegen must",
+    "shared y-axis",
+    "plot comparable growth rates on one percent",
+    "report overlap n with any correlation",
+)
+
+SERIES_LABELS = {
+    "CPIAUCSL": {
+        "name": "CPI all items",
+        "growth": "CPI growth",
+        "level": "CPI all items",
+        "aliases": ("cpi all", "consumer price", "inflation", "headline cpi"),
+        "result": "inflation",
+    },
+    "GDPC1": {
+        "name": "real GDP",
+        "growth": "Real GDP growth",
+        "level": "Real GDP",
+        "aliases": ("real gdp", "gross domestic"),
+        "result": "real GDP growth",
+    },
+    "UNRATE": {
+        "name": "unemployment rate",
+        "growth": "Unemployment rate change",
+        "level": "Unemployment rate",
+        "aliases": ("unemployment",),
+        "result": "the unemployment rate",
+    },
+}
 
 ALLOWED_LAYOUTS = {"single", "dual_axis", "stacked"}
 ALLOWED_CHART_TYPES = {"line", "scatter", "bars", "panels"}
@@ -127,6 +168,12 @@ def repair_chart_brief(
         payload["x_label"] = fallback.x_label
     if not str(payload.get("notes") or "").strip():
         payload["notes"] = fallback.notes
+    payload["notes"], payload["design_notes"] = _split_user_and_design_notes(
+        payload.get("notes") or "",
+        payload.get("design_notes") or "",
+        fallback.notes,
+        fallback.design_notes,
+    )
     if not str(payload.get("time_window_rationale") or "").strip():
         payload["time_window_rationale"] = fallback.time_window_rationale
     if not isinstance(payload.get("annotations"), list):
@@ -150,12 +197,12 @@ def _relationship_brief(
         f"{series_id} native units: {units_by_id.get(series_id, 'source units')}"
         for series_id in series_ids[:2]
     )
-    title_left = _plain_label(left)
-    title_right = _plain_label(right)
+    title_left = plain_series_name(left)
+    title_right = plain_series_name(right)
     return ChartBriefArtifact(
         claim=(
-            f"Period-over-period growth in {title_left} ({left}) and "
-            f"{title_right} ({right}) is contemporaneously associated."
+            f"{title_left} growth and {title_right} growth moved together or "
+            f"opposite each other over the overlapping window."
         ),
         series_ids=list(series_ids),
         transforms=["growth"],
@@ -169,20 +216,24 @@ def _relationship_brief(
         annotations=[
             "Recession shading omitted because no NBER recession series was fetched."
         ],
-        title=f"Period-over-period growth: {title_left} ({left}) vs {title_right} ({right})",
+        title=f"{growth_legend_label(left)} vs {growth_legend_label(right)}",
         x_label="date",
         y_label="percent change",
         units="percent",
         notes=(
+            f"Percent change in {title_left} ({left}) and {title_right} ({right}) "
+            "after aligning mixed frequencies."
+        ),
+        chart_type="line",
+        y_left_label=growth_legend_label(left),
+        y_right_label=growth_legend_label(right),
+        design_notes=(
             f"Align mixed frequencies with last-observation-carried-forward onto the "
             f"lower-frequency dates, then plot comparable growth rates on one percent "
             f"axis. {units_note}. Report overlap n with any correlation. Do not place "
             "incompatible raw levels on one shared y-axis; if a levels companion is "
             "shown, use dual-axis or stacked panels."
         ),
-        chart_type="line",
-        y_left_label=f"{title_left} ({left}) growth, percent",
-        y_right_label=f"{title_right} ({right}) growth, percent",
     )
 
 
@@ -204,16 +255,17 @@ def _cpi_brief(series_id: str, units: str) -> ChartBriefArtifact:
         x_label="date",
         y_label=f"CPI index ({units})",
         units=units,
-        notes=(
+        notes=f"CPI all-items index over the last five years ({units}).",
+        chart_type="line",
+        design_notes=(
             "Single-series levels chart. Do not force y=0; the index sits far from "
             "zero and a zero baseline would flatten the five-year move."
         ),
-        chart_type="line",
     )
 
 
 def _single_series_brief(series_id: str, units: str) -> ChartBriefArtifact:
-    label = _plain_label(series_id)
+    label = plain_series_name(series_id)
     return ChartBriefArtifact(
         claim=f"{label} ({series_id}) changed over the fetched window.",
         series_ids=[series_id],
@@ -231,11 +283,12 @@ def _single_series_brief(series_id: str, units: str) -> ChartBriefArtifact:
         x_label="date",
         y_label=f"{label} ({units})",
         units=units,
-        notes=(
+        notes=f"{label} ({series_id}) over the fetched window, in {units}.",
+        chart_type="line",
+        design_notes=(
             f"Single-series levels chart of {series_id} in {units}. Do not force "
             "y=0 unless plotting nonnegative bars."
         ),
-        chart_type="line",
     )
 
 
@@ -291,13 +344,78 @@ def _units_by_series(data: DataArtifact | dict[str, Any] | None) -> dict[str, st
     return units
 
 
-def _plain_label(series_id: str) -> str:
-    labels = {
-        "CPIAUCSL": "CPI all items",
-        "GDPC1": "real GDP",
-        "UNRATE": "unemployment rate",
-    }
-    return labels.get(series_id, series_id)
+def plain_series_name(series_id: str) -> str:
+    info = SERIES_LABELS.get(series_id)
+    if info:
+        return str(info["name"])
+    return series_id
+
+
+def growth_legend_label(series_id: str) -> str:
+    info = SERIES_LABELS.get(series_id)
+    if info:
+        return str(info["growth"])
+    return f"{series_id} growth"
+
+
+def level_legend_label(series_id: str) -> str:
+    info = SERIES_LABELS.get(series_id)
+    if info:
+        return str(info["level"])
+    return series_id
+
+
+def series_name_aliases(series_id: str) -> tuple[str, ...]:
+    info = SERIES_LABELS.get(series_id)
+    if info:
+        return tuple(info["aliases"])
+    return ()
+
+
+def result_phrase(series_id: str) -> str:
+    info = SERIES_LABELS.get(series_id)
+    if info and info.get("result"):
+        return str(info["result"])
+    return f"{plain_series_name(series_id)} growth"
+
+
+def is_instruction_note(text: str) -> bool:
+    blob = " ".join(str(text or "").lower().split())
+    if not blob:
+        return False
+    if blob.startswith("do not "):
+        return True
+    return any(phrase in blob for phrase in INSTRUCTION_NOTE_PHRASES)
+
+
+def user_facing_chart_notes(text: str, *, fallback: str = "") -> str:
+    if text and not is_instruction_note(text):
+        return str(text).strip()
+    return (fallback or "").strip()
+
+
+def humanize_field_name(field: str) -> str:
+    raw = str(field or "").strip()
+    if raw.lower().endswith("_growth"):
+        return growth_legend_label(raw[: -len("_growth")])
+    return level_legend_label(raw)
+
+
+def _split_user_and_design_notes(
+    notes: str,
+    design_notes: str,
+    fallback_notes: str,
+    fallback_design: str,
+) -> tuple[str, str]:
+    user = user_facing_chart_notes(notes, fallback=fallback_notes)
+    if is_instruction_note(user):
+        user = "Percent change after aligning mixed frequencies."
+    design = str(design_notes or "").strip()
+    if is_instruction_note(notes) and not design:
+        design = str(notes).strip()
+    if not design:
+        design = str(fallback_design or "").strip()
+    return user, design
 
 
 def _normalize_layout(value: Any) -> str:

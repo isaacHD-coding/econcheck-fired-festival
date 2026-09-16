@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from workers.artifacts import AnalysisArtifact, DraftArtifact
+from workers.chart_briefs import plain_series_name, result_phrase, series_name_aliases
 
 
 def canonical_cpi_analysis_code() -> str:
@@ -119,6 +120,34 @@ wants_growth = (not brief_transforms) or any(
     token in " ".join(brief_transforms)
     for token in ("growth", "yoy", "qoq", "mom", "zscore", "z-score", "percent")
 )
+SERIES_NAMES = {
+    "CPIAUCSL": {"name": "CPI all items", "growth": "CPI growth", "level": "CPI all items"},
+    "GDPC1": {"name": "real GDP", "growth": "Real GDP growth", "level": "Real GDP"},
+    "UNRATE": {"name": "unemployment rate", "growth": "Unemployment rate change", "level": "Unemployment rate"},
+}
+
+def series_name(series_id, kind="name"):
+    info = SERIES_NAMES.get(series_id) or {}
+    if kind == "growth":
+        return info.get("growth") or (series_id + " growth")
+    if kind == "level":
+        return info.get("level") or series_id
+    return info.get("name") or series_id
+
+def notes_are_instructions(text):
+    blob = " ".join(str(text or "").lower().split())
+    if not blob:
+        return False
+    if blob.startswith("do not "):
+        return True
+    markers = (
+        "do not place incompatible",
+        "if a levels companion",
+        "use dual-axis or stacked",
+        "plot comparable growth rates on one percent",
+        "follow the chart brief",
+    )
+    return any(marker in blob for marker in markers)
 
 def sorted_rows(series_id):
     return sorted(observations[series_id], key=lambda row: row["date"])
@@ -171,19 +200,23 @@ def pearson(xs, ys):
     return numerator / (denom_x * denom_y)
 
 left_id, right_id = series_ids[0], series_ids[1]
+left_name = series_name(left_id)
+right_name = series_name(right_id)
 correlation = round(pearson(growth[left_id], growth[right_id]), 4)
 relationship = (
-    "positive correlation"
+    "moved together"
     if correlation > 0.15
-    else "anti-correlation"
+    else "moved opposite each other"
     if correlation < -0.15
-    else "little contemporaneous correlation"
+    else "showed little relationship"
 )
+left_growth_field = f"{left_id}_growth"
+right_growth_field = f"{right_id}_growth"
 chart_rows = [
     {
         "date": current["date"],
-        f"{left_id}_growth": round(growth[left_id][index], 4),
-        f"{right_id}_growth": round(growth[right_id][index], 4),
+        left_growth_field: round(growth[left_id][index], 4),
+        right_growth_field: round(growth[right_id][index], 4),
     }
     for index, current in enumerate(aligned[1:])
 ]
@@ -206,25 +239,33 @@ levels_incompatible = (
     and max(left_amp, right_amp) / min(left_amp, right_amp) >= 10.0
 )
 overlap_n = len(growth[left_id])
+if notes_are_instructions(brief_notes):
+    brief_notes = ""
 growth_notes = brief_notes or (
-    "Growth rates share a percent axis so the correlation is visually readable. "
-    "Raw levels are not forced onto one scale. Mixed frequencies aligned with "
-    "last-observation-carried-forward; overlap n is reported on the correlation metric."
+    f"Percent change in {left_name} ({left_id}) and {right_name} ({right_id}) "
+    f"after aligning mixed frequencies ({overlap_n} overlapping periods)."
 )
-if "overlap" not in growth_notes.lower():
-    growth_notes = f"{growth_notes} Overlap n={overlap_n}."
+if "overlap" not in growth_notes.lower() and f"{overlap_n}" not in growth_notes:
+    growth_notes = f"{growth_notes} {overlap_n} overlapping periods."
+growth_title = brief_title if brief_title and "vs" in brief_title.lower() else (
+    f"{series_name(left_id, 'growth')} vs {series_name(right_id, 'growth')}"
+)
 growth_chart = {
     "type": brief_type if brief_type in {"line", "scatter", "bars", "panels"} else "line",
     "layout": "single" if wants_growth else brief_layout or "single",
     "shared_y_axis": True,
-    "title": brief_title or f"Period-over-period growth in {left_id} and {right_id}",
+    "title": growth_title,
     "x_field": "date",
-    "y_field": [f"{left_id}_growth", f"{right_id}_growth"],
+    "y_field": [left_growth_field, right_growth_field],
     "unit": brief_units or "percent",
     "y_label": brief_y_label or "percent change",
     "series_id": ",".join(series_ids),
     "series_ids": list(series_ids),
     "y_starts_at_zero": brief_y0,
+    "legend": {
+        left_growth_field: series_name(left_id, "growth"),
+        right_growth_field: series_name(right_id, "growth"),
+    },
     "data": chart_rows,
     "notes": growth_notes,
 }
@@ -234,21 +275,25 @@ if levels_incompatible or brief_layout in {"dual_axis", "stacked", "panels"}:
         "type": "line",
         "layout": levels_layout if levels_incompatible or brief_layout != "single" else "dual_axis",
         "shared_y_axis": False,
-        "title": f"{left_id} and {right_id} levels ({levels_layout.replace('_', ' ')})",
+        "title": f"{series_name(left_id, 'level')} and {series_name(right_id, 'level')} levels",
         "x_field": "date",
         "y_field": [left_id, right_id],
         "y_left": left_id,
         "y_right": right_id,
-        "y_left_label": f"{left_id} (source units)",
-        "y_right_label": f"{right_id} (source units)",
+        "y_left_label": f"{series_name(left_id, 'level')} ({left_id})",
+        "y_right_label": f"{series_name(right_id, 'level')} ({right_id})",
         "unit": "mixed native units",
         "series_id": ",".join(series_ids),
         "series_ids": list(series_ids),
         "y_starts_at_zero": False,
+        "legend": {
+            left_id: series_name(left_id, "level"),
+            right_id: series_name(right_id, "level"),
+        },
         "data": level_rows,
         "notes": (
-            "Independent scales because native units differ. This companion chart is "
-            "not the correlation visual; growth rates are on a shared percent axis."
+            f"{left_name} ({left_id}) and {right_name} ({right_id}) in native units, "
+            "each on its own scale."
         ),
     }
 else:
@@ -256,7 +301,7 @@ else:
         "type": "line",
         "layout": "single",
         "shared_y_axis": True,
-        "title": f"{left_id} and {right_id} over the overlapping window",
+        "title": f"{series_name(left_id, 'level')} and {series_name(right_id, 'level')}",
         "x_field": "date",
         "y_field": [left_id, right_id],
         "unit": "source units",
@@ -264,8 +309,12 @@ else:
         "series_id": ",".join(series_ids),
         "series_ids": list(series_ids),
         "y_starts_at_zero": False,
+        "legend": {
+            left_id: series_name(left_id, "level"),
+            right_id: series_name(right_id, "level"),
+        },
         "data": level_rows,
-        "notes": "Levels share an axis because native amplitudes are comparable.",
+        "notes": f"{left_name} ({left_id}) and {right_name} ({right_id}) in native units.",
     }
 
 charts = [growth_chart, levels_chart] if wants_growth else [levels_chart, growth_chart]
@@ -315,8 +364,8 @@ analysis_output = {
     "claims": [
         {
             "text": (
-                f"Aligned period-over-period growth in {left_id} and {right_id} "
-                f"shows {relationship}."
+                f"{left_name} ({left_id}) and {right_name} ({right_id}) growth "
+                f"{relationship}."
             ),
             "metric_refs": ["growth_correlation"],
         }
@@ -326,8 +375,7 @@ analysis_output = {
         "Aligned the lower-frequency series dates with last-observation-carried-forward "
         "values from higher-frequency series, then computed Pearson correlation of "
         "period-over-period percent changes. This is a contemporaneous association, "
-        "not a causal estimate or a full lead-lag scan. Chart layout follows the "
-        "structured chart brief when one is present in input_data metadata."
+        "not a causal estimate or a full lead-lag scan."
     ),
     "warnings": [
         "Series may have different native frequencies; alignment can undersample a monthly series.",
@@ -378,24 +426,51 @@ def relationship_draft(analysis: AnalysisArtifact) -> DraftArtifact:
         ]
         source_series = list(dict.fromkeys(source_series))
     left, right = (source_series + ["series_a", "series_b"])[:2]
+    left_name = plain_series_name(left)
+    right_name = plain_series_name(right)
+    left_result = result_phrase(left)
+    right_result = result_phrase(right)
     value = correlation.get("value")
     if isinstance(value, (int, float)):
+        rounded = round(float(value), 2)
         if value < -0.15:
-            relationship = "anti-correlated (negative contemporaneous association)"
+            lead = (
+                f"Over this window, {left_result} and {right_result} moved opposite "
+                f"each other; the correlation is about {rounded}."
+            )
         elif value > 0.15:
-            relationship = "positively correlated"
+            lead = (
+                f"Over this window, {left_result} and {right_result} moved together; "
+                f"the correlation is about {rounded}."
+            )
         else:
-            relationship = "only weakly contemporaneously associated"
+            lead = (
+                f"Over this window, {left_result} and {right_result} showed little "
+                f"relationship; the correlation is about {rounded}."
+            )
     else:
-        relationship = "associated"
+        lead = (
+            f"Over this window, {left_result} and {right_result} were compared "
+            "using aligned percent changes."
+        )
+    overlap_n = overlap.get("value")
+    overlap_bit = (
+        f"over {overlap_n} overlapping periods"
+        if overlap_n is not None
+        else "over the overlapping periods"
+    )
+    series_sentence = (
+        f"{_sentence_name(left_name)} ({left}) and {right_name} ({right}) "
+        "are the FRED series used here."
+    )
+    answer = (
+        f"{lead}\n\n"
+        f"{series_sentence}\n\n"
+        f"The estimate uses aligned period-over-period growth {overlap_bit}. "
+        "It is not causal and is not a full lead-lag study."
+    )
     return DraftArtifact(
-        answer=(
-            f"Over the overlapping FRED window, period-over-period growth in {left} "
-            f"and {right} is {relationship}. The Pearson correlation of aligned growth "
-            f"rates is {value} across {overlap.get('value')} overlapping periods. "
-            "This is a contemporaneous correlation of growth rates after aligning mixed "
-            "frequencies; it is not a causal claim and does not by itself identify lead-lag."
-        ),
+        answer=answer,
         referenced_metrics=[
             name
             for name in ("growth_correlation", "overlap_periods", "latest_left_value", "latest_right_value")
@@ -405,17 +480,64 @@ def relationship_draft(analysis: AnalysisArtifact) -> DraftArtifact:
     )
 
 
+def looks_like_jargony_relationship_draft(draft: Any) -> bool:
+    text = _draft_answer_text(draft).lower()
+    if not text:
+        return True
+    return any(
+        phrase in text
+        for phrase in (
+            "contemporaneous association",
+            "contemporaneously associated",
+            "does not by itself identify lead-lag",
+            "period-over-period growth in cpiaucsl",
+        )
+    )
+
+
+def draft_uses_plain_series_names(draft: Any, analysis: AnalysisArtifact | None = None) -> bool:
+    text = _draft_answer_text(draft).lower()
+    series_ids: list[str] = []
+    if analysis is not None:
+        for metric in analysis.metrics:
+            if not isinstance(metric, dict):
+                continue
+            for series_id in metric.get("source_series") or []:
+                if isinstance(series_id, str) and series_id not in series_ids:
+                    series_ids.append(series_id)
+    if not series_ids:
+        series_ids = ["CPIAUCSL", "GDPC1"]
+    for series_id in series_ids:
+        aliases = series_name_aliases(series_id)
+        if not aliases:
+            continue
+        if not any(alias in text for alias in aliases):
+            return False
+    return True
+
+
 def looks_like_canned_cpi_draft(draft: Any) -> bool:
-    answer = ""
-    if hasattr(draft, "answer"):
-        answer = str(draft.answer)
-    elif isinstance(draft, dict):
-        answer = str(draft.get("answer") or "")
-    text = answer.lower()
+    text = _draft_answer_text(draft).lower()
     return (
         "has left the cpi index materially higher" in text
         or "the cpiaucsl index increased by" in text
     ) and "correlation" not in text
+
+
+def _draft_answer_text(draft: Any) -> str:
+    if hasattr(draft, "answer"):
+        return str(draft.answer)
+    if isinstance(draft, dict):
+        return str(draft.get("answer") or "")
+    return ""
+
+
+def _sentence_name(name: str) -> str:
+    if not name:
+        return name
+    if name[:1].islower():
+        return name[0].upper() + name[1:]
+    return name
 
 
 def _metrics_by_name(analysis: AnalysisArtifact) -> dict[str, dict[str, Any]]:
