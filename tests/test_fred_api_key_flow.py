@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 
 import app.chat as chat
@@ -110,9 +111,12 @@ def test_run_question_passes_explicit_fred_api_key_to_orchestrator(
 
 def _fresh_cpi_rows() -> list[dict[str, object]]:
     rows = []
+    today = date.today()
+    start_year = today.year - 5
+    start_month = today.month
     for index in range(61):
-        month_index = 5 + index
-        year = 2021 + month_index // 12
+        month_index = start_month - 1 + index
+        year = start_year + month_index // 12
         month = month_index % 12 + 1
         rows.append(
             {

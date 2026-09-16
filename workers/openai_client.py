@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
+
+from harness.config import resolve_openai_api_key as _resolve_openai_api_key
 
 
 DEFAULT_OPENAI_MODEL = "gpt-5.5"
@@ -15,11 +16,12 @@ class OpenAIClientError(RuntimeError):
 
 
 def resolve_openai_api_key(api_key: str | None) -> str:
-    resolved = (api_key or "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+    resolved = _resolve_openai_api_key(api_key)
     if not resolved:
         raise OpenAIClientError(
-            "OPENAI_API_KEY not configured. Enter an OpenAI API key or set "
-            "OPENAI_API_KEY and rerun."
+            "OPENAI_API_KEY is not configured. Enter an OpenAI API key or set "
+            "OPENAI_API_KEY in your environment, a local .env file, or Streamlit "
+            "secrets, then rerun."
         )
     return resolved
 

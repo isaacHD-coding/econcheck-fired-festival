@@ -1,3 +1,5 @@
+from datetime import date
+
 from types import SimpleNamespace
 
 from harness.checkpoints import (
@@ -13,7 +15,7 @@ from harness.checkpoints import (
     SourceProvenanceCheckpoint,
     SuccessCriteriaCheckpoint,
 )
-from workers.artifacts import AnalysisArtifact, DraftArtifact
+from workers.artifacts import AnalysisArtifact, DataArtifact, DraftArtifact
 
 
 def valid_analysis(metrics: list | None = None) -> AnalysisArtifact:
@@ -30,9 +32,32 @@ def valid_analysis(metrics: list | None = None) -> AnalysisArtifact:
             }
         ],
         claims=[],
-        charts=[],
+        charts=[{"type": "line", "title": "CPI", "data": [{"date": "2026-01-01", "value": 310.3}]}],
         method_notes="Computed from FRED data.",
         warnings=[],
+    )
+
+
+def valid_data(series_id: str = "CPIAUCSL", rows: int = 61) -> DataArtifact:
+    observations = []
+    today = date.today()
+    start_year = today.year - 5
+    start_month = today.month
+    for index in range(rows):
+        month_index = start_month - 1 + index
+        year = start_year + month_index // 12
+        month = month_index % 12 + 1
+        observations.append(
+            {
+                "series_id": series_id,
+                "date": f"{year:04d}-{month:02d}-01",
+                "value": 260.0 + index,
+            }
+        )
+    return DataArtifact(
+        series_ids=[series_id],
+        observations={series_id: observations},
+        metadata={"source": "FRED"},
     )
 
 
@@ -84,16 +109,54 @@ def test_source_provenance_checkpoint_fails_metric_missing_source_series():
     assert result.alarm.retry_from == "code_generation"
 
 
-def test_stub_data_checkpoints_are_testable_and_pass_for_now():
-    for checkpoint in (
-        DataCompletenessCheckpoint(),
-        FreshnessCheckpoint(),
-        InformationSufficiencyCheckpoint(),
-    ):
-        result = checkpoint.evaluate(valid_analysis())
+def test_data_completeness_checkpoint_passes_enough_observations():
+    result = DataCompletenessCheckpoint().evaluate(
+        valid_data(),
+        selected_series=[{"series_id": "CPIAUCSL", "frequency": "Monthly"}],
+    )
 
-        assert result.passed is True
-        assert result.alarm is None
+    assert result.passed is True
+    assert result.alarm is None
+
+
+def test_data_completeness_checkpoint_fails_short_series():
+    result = DataCompletenessCheckpoint().evaluate(
+        valid_data(rows=10),
+        selected_series=[{"series_id": "CPIAUCSL", "frequency": "Monthly"}],
+    )
+
+    assert result.passed is False
+    assert result.alarm is not None
+    assert result.alarm.retry_from == "data_discovery"
+
+
+def test_freshness_checkpoint_fails_stale_observations():
+    data = DataArtifact(
+        series_ids=["CPIAUCSL"],
+        observations={
+            "CPIAUCSL": [
+                {"series_id": "CPIAUCSL", "date": "2010-01-01", "value": 200.0}
+            ]
+        },
+        metadata={"source": "FRED"},
+    )
+
+    result = FreshnessCheckpoint().evaluate(data, selected_ids=["CPIAUCSL"])
+
+    assert result.passed is False
+    assert result.alarm is not None
+    assert result.alarm.retry_from == "data_discovery"
+
+
+def test_information_sufficiency_requires_cpiaucsl_for_cpi_questions():
+    result = InformationSufficiencyCheckpoint().evaluate(
+        valid_data(series_id="UNRATE"),
+        selected_ids=["UNRATE"],
+        question="What has happened to CPI inflation over the last five years?",
+    )
+
+    assert result.passed is False
+    assert result.alarm is not None
 
 
 def test_code_execution_checkpoint_passes_plain_analysis_artifact():
@@ -161,12 +224,34 @@ def test_output_shape_checkpoint_fails_malformed_object_without_throwing():
     assert result.alarm.retry_from == "code_generation"
 
 
-def test_stub_code_checkpoints_are_testable_and_pass_for_now():
-    for checkpoint in (MathSanityCheckpoint(), ChartPromiseCheckpoint()):
-        result = checkpoint.evaluate(valid_analysis())
+def test_math_sanity_checkpoint_rejects_non_finite_metrics():
+    analysis = valid_analysis(
+        metrics=[
+            {
+                "name": "bad",
+                "value": float("nan"),
+                "unit": "percent",
+                "source_series": ["CPIAUCSL"],
+            }
+        ]
+    )
 
-        assert result.passed is True
-        assert result.alarm is None
+    result = MathSanityCheckpoint().evaluate(analysis)
+
+    assert result.passed is False
+    assert result.alarm is not None
+    assert result.alarm.retry_from == "code_generation"
+
+
+def test_chart_promise_checkpoint_fails_without_charts():
+    analysis = valid_analysis()
+    analysis.charts = []
+
+    result = ChartPromiseCheckpoint().evaluate(analysis)
+
+    assert result.passed is False
+    assert result.alarm is not None
+    assert result.alarm.retry_from == "code_generation"
 
 
 def test_answer_grounding_checkpoint_passes_when_referenced_metrics_exist():
@@ -197,10 +282,26 @@ def test_answer_grounding_checkpoint_fails_missing_metric_reference():
     assert result.alarm.retry_from == "draft_answer"
 
 
-def test_success_criteria_checkpoint_is_testable_and_passes_for_now():
+def test_success_criteria_checkpoint_requires_grounded_answer():
     result = SuccessCriteriaCheckpoint().evaluate(
         DraftArtifact(answer="", referenced_metrics=[], chart_paths=[]),
         valid_analysis(),
+        question="What has happened to CPI inflation over the last five years?",
+    )
+
+    assert result.passed is False
+    assert result.alarm is not None
+
+
+def test_success_criteria_checkpoint_passes_grounded_cpi_answer():
+    result = SuccessCriteriaCheckpoint().evaluate(
+        DraftArtifact(
+            answer="CPI rose over five years.",
+            referenced_metrics=["latest_cpi"],
+            chart_paths=[],
+        ),
+        valid_analysis(),
+        question="What has happened to CPI inflation over the last five years?",
     )
 
     assert result.passed is True

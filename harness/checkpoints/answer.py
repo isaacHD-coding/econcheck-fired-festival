@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from harness.checkpoints.base import CheckpointResult
+from harness.domain import is_cpi_question
 
 
 class AnswerGroundingCheckpoint:
@@ -29,6 +30,15 @@ class AnswerGroundingCheckpoint:
             for name in [_read_field(metric, "name")]
             if isinstance(name, str)
         }
+        if not referenced_metrics:
+            return CheckpointResult.fail_result(
+                checkpoint_name=self.__class__.__name__,
+                stage="draft_answer",
+                message="Draft answer must reference generated metric names.",
+                retry_from="draft_answer",
+                context={"available_metrics": sorted(available_metrics)},
+            )
+
         missing = [
             metric_name
             for metric_name in referenced_metrics
@@ -50,13 +60,51 @@ class AnswerGroundingCheckpoint:
 
 
 class SuccessCriteriaCheckpoint:
-    """Stub checkpoint reserved for success-criteria validation."""
+    """Require a non-empty grounded answer that covers plan-level success criteria."""
 
-    def evaluate(self, draft: Any, analysis: Any | None = None) -> CheckpointResult:
-        return CheckpointResult.pass_result("Success criteria stub passed.")
+    def evaluate(
+        self,
+        draft: Any,
+        analysis: Any | None = None,
+        plan: Any | None = None,
+        question: str = "",
+    ) -> CheckpointResult:
+        answer = str(_read_field(draft, "answer") or "").strip()
+        referenced = _read_field(draft, "referenced_metrics") or []
+        criteria = list(_read_field(plan, "success_criteria") or []) if plan is not None else []
+        needs_cpi = is_cpi_question(question) or any("cpi" in str(item).lower() for item in criteria)
+
+        if not answer or not referenced:
+            return CheckpointResult.fail_result(
+                checkpoint_name=self.__class__.__name__,
+                stage="draft_answer",
+                message="Draft answer must include grounded metric references.",
+                retry_from="draft_answer",
+                context={"success_criteria": criteria},
+            )
+        if needs_cpi and "cpi" not in answer.lower():
+            return CheckpointResult.fail_result(
+                checkpoint_name=self.__class__.__name__,
+                stage="draft_answer",
+                message="CPI questions must produce an answer that cites CPI evidence.",
+                retry_from="draft_answer",
+                context={"success_criteria": criteria},
+            )
+        if criteria and not all(str(item).strip() for item in criteria):
+            return CheckpointResult.fail_result(
+                checkpoint_name=self.__class__.__name__,
+                stage="draft_answer",
+                message="Plan success criteria are missing or empty.",
+                retry_from="planning",
+                context={"success_criteria": criteria},
+            )
+
+        return CheckpointResult.pass_result("Draft answer satisfies the plan success criteria.")
 
 
 def _read_field(item: Any, field_name: str) -> Any:
+    if item is None:
+        return None
     if isinstance(item, Mapping):
         return item.get(field_name)
     return getattr(item, field_name, None)

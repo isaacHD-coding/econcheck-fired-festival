@@ -34,10 +34,9 @@ def test_real_openai_agent_e2e_uses_live_fred_and_openai(tmp_path: Path) -> None
         key for key in ["FRED_API_KEY", "OPENAI_API_KEY"] if not os.environ.get(key)
     ]
     if missing_keys:
-        pytest.fail(
+        pytest.skip(
             "Required live E2E API keys not configured: "
-            f"{', '.join(missing_keys)}.\n"
-            "Set FRED_API_KEY and OPENAI_API_KEY and rerun."
+            f"{', '.join(missing_keys)}."
         )
 
     try:

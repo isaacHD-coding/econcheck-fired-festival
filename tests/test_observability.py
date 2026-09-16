@@ -29,11 +29,30 @@ def test_fixture_loading_normalizes_sample_cpi_run() -> None:
     assert run.draft["answer"]
 
 
-def test_runs_mode_is_future_seam_only() -> None:
+def test_runs_mode_loads_persisted_orchestrator_artifacts(tmp_path) -> None:
     from harness.observability import load_run_artifacts
 
-    with pytest.raises(NotImplementedError, match="future integration seam"):
-        load_run_artifacts("run-1", mode="runs")
+    run_dir = tmp_path / "run-live"
+    run_dir.mkdir()
+    (run_dir / "state.json").write_text('{"run_id": "run-live", "current_stage": "released"}')
+    (run_dir / "input.json").write_text('{"question": "What happened to CPI?"}')
+    (run_dir / "plan.json").write_text('{"question_type": "trend"}')
+    (run_dir / "selected_data.json").write_text('{"selected_series": [{"series_id": "CPIAUCSL"}]}')
+    (run_dir / "generated_code.py").write_text("analysis_output = {}")
+    (run_dir / "checkpoint_results.json").write_text(
+        '{"checks": [{"kind": "checkpoint", "name": "OutputShapeCheckpoint", "passed": true}]}'
+    )
+    (run_dir / "alarms.json").write_text("[]")
+    (run_dir / "draft.json").write_text('{"answer": "CPI rose.", "referenced_metrics": ["latest_cpi"]}')
+
+    run = load_run_artifacts("run-live", mode="runs", runs_dir=tmp_path)
+
+    assert run.source == "runs"
+    assert run.planner["question_type"] == "trend"
+    assert run.data_selection["selected_series"][0]["series_id"] == "CPIAUCSL"
+    assert "analysis_output" in run.code["code"]
+    assert run.draft["answer"] == "CPI rose."
+    assert run.checkpoints[0]["name"] == "OutputShapeCheckpoint"
 
 
 def test_guardrails_and_checkpoints_are_loaded_separately() -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 from typing import Any
 
 from harness.checkpoints.base import CheckpointResult
@@ -56,20 +57,44 @@ class OutputShapeCheckpoint:
 
 
 class MathSanityCheckpoint:
-    """Stub checkpoint reserved for math sanity checks."""
+    """Require numeric metrics to be finite and present."""
 
     def evaluate(self, analysis: Any) -> CheckpointResult:
-        return CheckpointResult.pass_result("Math sanity stub passed.")
+        metrics = _read_field(analysis, "metrics", [])
+        if not isinstance(metrics, list):
+            metrics = []
+        values = [
+            metric.get("value")
+            for metric in metrics
+            if isinstance(metric, dict) and isinstance(metric.get("value"), (int, float))
+        ]
+        if not values or any(not math.isfinite(value) for value in values):
+            return CheckpointResult.fail_result(
+                checkpoint_name=self.__class__.__name__,
+                stage="code_generation",
+                message="Metric values must be finite numbers.",
+                retry_from="code_generation",
+                context={"metric_values": values},
+            )
+        return CheckpointResult.pass_result("Metric values are finite.")
 
 
 class ChartPromiseCheckpoint:
-    """Stub checkpoint reserved for chart promise checks."""
+    """Require analysis output to include chart descriptor data."""
 
     def evaluate(self, analysis: Any) -> CheckpointResult:
-        return CheckpointResult.pass_result("Chart promise stub passed.")
+        charts = _read_field(analysis, "charts", [])
+        if not isinstance(charts, list) or not charts:
+            return CheckpointResult.fail_result(
+                checkpoint_name=self.__class__.__name__,
+                stage="code_generation",
+                message="Analysis must include chart descriptor data.",
+                retry_from="code_generation",
+            )
+        return CheckpointResult.pass_result("Analysis includes chart descriptor data.")
 
 
-def _read_field(item: Any, field_name: str, default: Any) -> Any:
+def _read_field(item: Any, field_name: str, default: Any = None) -> Any:
     if isinstance(item, Mapping):
         return item.get(field_name, default)
     return getattr(item, field_name, default)

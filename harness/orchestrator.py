@@ -1,17 +1,28 @@
-"""Orchestrator skeleton for EconCheck run control."""
+"""Orchestrator for EconCheck run control."""
 
 from __future__ import annotations
 
-from datetime import date, datetime
-import math
-from pathlib import Path
 from typing import Any
+from pathlib import Path
 
 from harness.alarms import Alarm
+from harness.checkpoints import (
+    AnswerGroundingCheckpoint,
+    ChartPromiseCheckpoint,
+    CodeExecutionCheckpoint,
+    DataCompletenessCheckpoint,
+    FreshnessCheckpoint,
+    InformationSufficiencyCheckpoint,
+    MathSanityCheckpoint,
+    OutputShapeCheckpoint,
+    SourceProvenanceCheckpoint,
+    SuccessCriteriaCheckpoint,
+)
+from harness.guardrails import INPUT_GUARDRAILS, PLANNING_GUARDRAILS
 from harness.persistence import save_artifact, save_run_state, save_text_artifact
 from harness.state import RunState, Stage
 from harness.tools.code_runner import run_analysis_code
-from harness.tools.fred import fred_fetch, fred_search
+from harness.tools.fred import FredConfigurationError, FredToolError, fred_fetch, fred_search
 from workers.artifacts import (
     AnalysisArtifact,
     CheckerArtifact,
@@ -42,6 +53,14 @@ RETRY_STAGES = {
 }
 
 
+class StageControl(Exception):
+    """Interrupt the current stage after alarm routing."""
+
+    def __init__(self, action: str) -> None:
+        self.action = action
+        super().__init__(action)
+
+
 class Orchestrator:
     """Owns stage progression, retries, escalation, and release decisions."""
 
@@ -59,6 +78,8 @@ class Orchestrator:
         self.checker = checker
         self.fred_api_key = fred_api_key or None
         self._checks: list[dict[str, Any]] = []
+        self._guardrails: list[dict[str, Any]] = []
+        self._timeline: list[dict[str, Any]] = []
         self._persist()
 
     def run(self) -> RunState:
@@ -153,34 +174,151 @@ class Orchestrator:
         )
         self._persist_alarms()
 
+        context: dict[str, Any] = {}
         try:
-            plan = self._planning_stage()
+            self._run_input_guardrails()
+            self._require_fred_configured()
+            if self.state.current_stage is Stage.INPUT:
+                self._set_stage(Stage.PLANNING)
+        except StageControl:
+            return self.state
+
+        while self.state.current_stage not in TERMINAL_STAGES:
+            try:
+                self._continue_from_current_stage(context)
+            except StageControl as control:
+                if control.action != "retry" or self.state.current_stage in TERMINAL_STAGES:
+                    return self.state
+            except Exception as exc:
+                if self.state.current_stage is not Stage.ESCALATED:
+                    try:
+                        self._fail_with_alarm(
+                            type="stage_failed",
+                            message=f"{self.state.current_stage.value} failed: {exc}",
+                            context={"error": repr(exc)},
+                            retry_from=self._retry_from_current_stage(),
+                            recommended_action="escalate",
+                        )
+                    except StageControl:
+                        return self.state
+                return self.state
+        return self.state
+
+    def _continue_from_current_stage(self, context: dict[str, Any]) -> None:
+        stage = self.state.current_stage
+        if stage is Stage.PLANNING:
+            context["plan"] = self._planning_stage()
+            self._set_stage(Stage.DATA_DISCOVERY)
+            return
+        if stage is Stage.DATA_DISCOVERY:
+            plan = context.get("plan") or self._planning_stage()
+            context["plan"] = plan
             search_payload, selection, data = self._data_discovery_stage(plan)
-            analysis = self._code_generation_stage(plan, data)
-            draft = self._draft_answer_stage(plan, analysis)
-            checker_artifact = self._checker_review_stage(
-                plan,
-                data,
-                analysis,
+            context["search_payload"] = search_payload
+            context["selection"] = selection
+            context["data"] = data
+            self._set_stage(Stage.CODE_GENERATION)
+            return
+        if stage is Stage.CODE_GENERATION:
+            plan = context.get("plan") or self._planning_stage()
+            data = context.get("data")
+            if data is None:
+                search_payload, selection, data = self._data_discovery_stage(plan)
+                context["search_payload"] = search_payload
+                context["selection"] = selection
+                context["data"] = data
+            context["plan"] = plan
+            context["analysis"] = self._code_generation_stage(plan, data)
+            self._set_stage(Stage.DRAFT_ANSWER)
+            return
+        if stage is Stage.DRAFT_ANSWER:
+            plan = context.get("plan") or self._planning_stage()
+            analysis = context.get("analysis")
+            if analysis is None:
+                data = context.get("data")
+                if data is None:
+                    _, _, data = self._data_discovery_stage(plan)
+                    context["data"] = data
+                analysis = self._code_generation_stage(plan, data)
+                context["analysis"] = analysis
+            context["plan"] = plan
+            context["draft"] = self._draft_answer_stage(plan, analysis)
+            self._set_stage(Stage.CHECKER_REVIEW)
+            return
+        if stage is Stage.CHECKER_REVIEW:
+            plan = context.get("plan") or self._planning_stage()
+            data = context.get("data")
+            analysis = context.get("analysis")
+            draft = context.get("draft")
+            if data is None or analysis is None or draft is None:
+                raise RuntimeError("Checker review is missing required artifacts.")
+            checker_artifact = self._checker_review_stage(plan, data, analysis, draft)
+            self._release_answer(
                 draft,
+                checker_artifact,
+                context.get("search_payload") or {},
+                context.get("selection") or DataSelectionArtifact([], [], ""),
             )
-            self._release_answer(draft, checker_artifact, search_payload, selection)
-            return self.release()
-        except Exception as exc:
-            if self.state.current_stage is not Stage.ESCALATED:
-                self._escalate_with_alarm(
-                    type="stage_failed",
-                    message=f"{self.state.current_stage.value} failed: {exc}",
-                    context={"error": repr(exc)},
-                    retry_from=self._retry_from_current_stage(),
-                )
-            raise
+            self._append_timeline(
+                "release",
+                "Release",
+                "complete",
+                "draft",
+                "Grounded answer released.",
+            )
+            self.release()
+            return
+
+        self.escalate()
+
+    def _run_input_guardrails(self) -> None:
+        self._set_stage(Stage.INPUT)
+        for guardrail in INPUT_GUARDRAILS:
+            result = guardrail.evaluate(self.state.question)
+            self._record_guardrail(guardrail.__class__.__name__, "input", result)
+            if not result.passed:
+                self._fail_from_result(result.alarm, default_action="escalate")
+        self._append_timeline(
+            "input_guardrails",
+            "Input Guardrails",
+            "complete",
+            "guardrails",
+            "Question passed economic-scope and safety checks.",
+        )
+
+    def _require_fred_configured(self) -> None:
+        from harness.config import resolve_fred_api_key
+
+        if resolve_fred_api_key(self.fred_api_key):
+            return
+        self._fail_with_alarm(
+            type="fred_not_configured",
+            message=(
+                "FRED_API_KEY is not configured. Set it in your environment, a "
+                ".env file, or Streamlit secrets."
+            ),
+            context={},
+            retry_from="data_discovery",
+            recommended_action="escalate",
+        )
 
     def _planning_stage(self) -> PlannerArtifact:
         self._set_stage(Stage.PLANNING)
         plan = self.worker.plan(self.state.question, self.state)
         plan = PlannerArtifact.from_dict(plan.to_dict())
         self._save_json_artifact("plan", plan)
+        for guardrail in PLANNING_GUARDRAILS:
+            result = guardrail.evaluate(plan)
+            self._record_guardrail(guardrail.__class__.__name__, "planning", result)
+            if not result.passed:
+                self._fail_from_result(result.alarm, default_action="retry")
+        self._append_timeline(
+            "planning",
+            "Planning",
+            "complete",
+            "planner",
+            "Planner produced a structured FRED analysis plan.",
+        )
         return plan
 
     def _data_discovery_stage(
@@ -191,11 +329,27 @@ class Orchestrator:
 
         queries = []
         flattened_results: list[dict[str, Any]] = []
-        for query in plan.search_queries:
-            results = fred_search(query, api_key=self.fred_api_key)
-            result_dicts = [result.to_dict() for result in results]
-            queries.append({"query": query, "results": result_dicts})
-            flattened_results.extend(result_dicts)
+        try:
+            for query in plan.search_queries:
+                results = fred_search(query, api_key=self.fred_api_key)
+                result_dicts = [result.to_dict() for result in results]
+                queries.append({"query": query, "results": result_dicts})
+                flattened_results.extend(result_dicts)
+        except FredConfigurationError as exc:
+            self._fail_with_alarm(
+                type="fred_not_configured",
+                message=str(exc),
+                context={"error": repr(exc)},
+                retry_from="data_discovery",
+                recommended_action="escalate",
+            )
+        except FredToolError as exc:
+            self._fail_with_alarm(
+                type="fred_search_failed",
+                message=str(exc),
+                context={"error": repr(exc)},
+                retry_from="data_discovery",
+            )
 
         search_payload = {"queries": queries}
         self._save_json_artifact("fred_search", search_payload)
@@ -210,23 +364,47 @@ class Orchestrator:
             if series.get("series_id")
         ]
         if not selected_ids:
-            self._raise_with_alarm(
+            self._fail_with_alarm(
                 type="data_selection_failed",
                 message="Worker did not select any FRED series.",
                 context={"selected_data": selection.to_dict()},
                 retry_from="data_discovery",
             )
 
-        data = fred_fetch(
-            selected_ids,
-            api_key=self.fred_api_key,
-            observation_start=_five_years_ago(),
-        )
+        try:
+            data = fred_fetch(
+                selected_ids,
+                api_key=self.fred_api_key,
+                observation_start=_five_years_ago(),
+            )
+        except FredConfigurationError as exc:
+            self._fail_with_alarm(
+                type="fred_not_configured",
+                message=str(exc),
+                context={"error": repr(exc)},
+                retry_from="data_discovery",
+                recommended_action="escalate",
+            )
+        except FredToolError as exc:
+            self._fail_with_alarm(
+                type="fred_fetch_failed",
+                message=str(exc),
+                context={"error": repr(exc), "selected_series": selected_ids},
+                retry_from="data_discovery",
+            )
+
         data.metadata["selected_series"] = selection.selected_series
         self._save_json_artifact("data", data)
 
         self._run_data_checks(selection, data, flattened_results)
         self._require_stage_checks_passed(Stage.DATA_DISCOVERY)
+        self._append_timeline(
+            "data_discovery",
+            "Data Discovery",
+            "complete",
+            "data_selection",
+            "Harness searched FRED and fetched selected observations.",
+        )
         return search_payload, selection, data
 
     def _code_generation_stage(
@@ -251,7 +429,11 @@ class Orchestrator:
                 output_log_path=code_output_path,
             )
         except Exception as exc:
-            self._raise_with_alarm(
+            self._apply_checkpoint(CodeExecutionCheckpoint().evaluate({
+                "succeeded": False,
+                "execution_error": repr(exc),
+            }))
+            self._fail_with_alarm(
                 type="code_execution_failed",
                 message="Generated analysis code failed.",
                 context={
@@ -267,6 +449,13 @@ class Orchestrator:
 
         self._run_code_checks(analysis)
         self._require_stage_checks_passed(Stage.CODE_GENERATION)
+        self._append_timeline(
+            "code_generation",
+            "Code Generation",
+            "complete",
+            "code",
+            "Harness executed worker-generated analysis code.",
+        )
         return analysis
 
     def _draft_answer_stage(
@@ -281,6 +470,13 @@ class Orchestrator:
 
         self._run_answer_checks(plan, analysis, draft)
         self._require_stage_checks_passed(Stage.DRAFT_ANSWER)
+        self._append_timeline(
+            "draft_answer",
+            "Draft Answer",
+            "complete",
+            "analysis",
+            "Worker drafted a grounded user-facing answer.",
+        )
         return draft
 
     def _checker_review_stage(
@@ -296,7 +492,7 @@ class Orchestrator:
         self._save_json_artifact("checker", checker_artifact)
 
         if not checker_artifact.passed:
-            self._raise_with_alarm(
+            self._fail_with_alarm(
                 type="checker_failed",
                 message="Checker did not approve the draft answer.",
                 context=checker_artifact.to_dict(),
@@ -335,97 +531,59 @@ class Orchestrator:
         search_results: list[dict[str, Any]],
     ) -> None:
         selected_ids = [series["series_id"] for series in selection.selected_series]
-        searched_ids = {result.get("series_id") for result in search_results}
-        self._record_check(
-            "SourceProvenanceCheckpoint",
-            Stage.DATA_DISCOVERY,
-            all(series_id in searched_ids for series_id in selected_ids),
-            "Selected series must come from live FRED search results.",
-            {"selected_series": selected_ids},
+        self._apply_checkpoint(
+            SourceProvenanceCheckpoint().evaluate(selection, search_results),
+            name="SourceProvenanceCheckpoint",
+            stage=Stage.DATA_DISCOVERY,
         )
-
-        counts = {
-            series_id: len(data.observations.get(series_id, []))
-            for series_id in selected_ids
-        }
-        self._record_check(
-            "DataCompletenessCheckpoint",
-            Stage.DATA_DISCOVERY,
-            bool(counts) and all(count >= 48 for count in counts.values()),
-            "Selected series must include at least 48 numeric observations.",
-            {"observation_counts": counts},
+        self._apply_checkpoint(
+            DataCompletenessCheckpoint().evaluate(
+                data,
+                selected_series=selection.selected_series,
+            ),
+            name="DataCompletenessCheckpoint",
+            stage=Stage.DATA_DISCOVERY,
         )
-
-        latest_dates = {
-            series_id: _latest_observation_date(data.observations.get(series_id, []))
-            for series_id in selected_ids
-        }
-        freshness_passed = bool(latest_dates) and all(
-            latest is not None and (date.today() - latest).days <= 150
-            for latest in latest_dates.values()
+        self._apply_checkpoint(
+            FreshnessCheckpoint().evaluate(data, selected_ids=selected_ids),
+            name="FreshnessCheckpoint",
+            stage=Stage.DATA_DISCOVERY,
         )
-        self._record_check(
-            "FreshnessCheckpoint",
-            Stage.DATA_DISCOVERY,
-            freshness_passed,
-            "Latest CPI observations should reflect normal monthly release lag.",
-            {
-                "latest_dates": {
-                    series_id: latest.isoformat() if latest is not None else None
-                    for series_id, latest in latest_dates.items()
-                }
-            },
-        )
-
-        self._record_check(
-            "InformationSufficiencyCheckpoint",
-            Stage.DATA_DISCOVERY,
-            "CPIAUCSL" in selected_ids and bool(data.observations.get("CPIAUCSL")),
-            "CPIAUCSL observations are required for the canonical CPI question.",
-            {"selected_series": selected_ids},
+        self._apply_checkpoint(
+            InformationSufficiencyCheckpoint().evaluate(
+                data,
+                selected_ids=selected_ids,
+                question=self.state.question,
+            ),
+            name="InformationSufficiencyCheckpoint",
+            stage=Stage.DATA_DISCOVERY,
         )
 
     def _run_code_checks(self, analysis: AnalysisArtifact) -> None:
-        self._record_check(
-            "CodeExecutionCheckpoint",
-            Stage.CODE_GENERATION,
-            isinstance(analysis, AnalysisArtifact),
-            "Generated code must execute and return an AnalysisArtifact.",
+        self._apply_checkpoint(
+            CodeExecutionCheckpoint().evaluate(analysis),
+            name="CodeExecutionCheckpoint",
+            stage=Stage.CODE_GENERATION,
         )
-        self._record_check(
-            "OutputShapeCheckpoint",
-            Stage.CODE_GENERATION,
-            all(
-                isinstance(value, list)
-                for value in [
-                    analysis.tables,
-                    analysis.metrics,
-                    analysis.claims,
-                    analysis.charts,
-                    analysis.warnings,
-                ]
-            )
-            and isinstance(analysis.method_notes, str),
-            "Analysis output must match the required outer schema.",
+        self._apply_checkpoint(
+            OutputShapeCheckpoint().evaluate(analysis),
+            name="OutputShapeCheckpoint",
+            stage=Stage.CODE_GENERATION,
         )
-        metric_values = [
-            metric.get("value")
-            for metric in analysis.metrics
-            if isinstance(metric, dict) and isinstance(metric.get("value"), (int, float))
-        ]
-        self._record_check(
-            "MathSanityCheckpoint",
-            Stage.CODE_GENERATION,
-            bool(metric_values)
-            and all(math.isfinite(value) and abs(value) < 1000 for value in metric_values),
-            "Metric values must be finite and plausibly scaled.",
-            {"metric_values": metric_values},
+        self._apply_checkpoint(
+            SourceProvenanceCheckpoint().evaluate(analysis),
+            name="MetricSourceProvenanceCheckpoint",
+            stage=Stage.CODE_GENERATION,
         )
-        self._record_check(
-            "ChartPromiseCheckpoint",
-            Stage.CODE_GENERATION,
-            bool(analysis.charts),
-            "Analysis must include chart descriptor data.",
+        self._apply_checkpoint(
+            MathSanityCheckpoint().evaluate(analysis),
+            name="MathSanityCheckpoint",
+            stage=Stage.CODE_GENERATION,
+        )
+        self._apply_checkpoint(
+            ChartPromiseCheckpoint().evaluate(analysis),
+            name="ChartPromiseCheckpoint",
+            stage=Stage.CODE_GENERATION,
         )
 
     def _run_answer_checks(
@@ -434,29 +592,37 @@ class Orchestrator:
         analysis: AnalysisArtifact,
         draft: DraftArtifact,
     ) -> None:
-        metric_names = {
-            metric.get("name")
-            for metric in analysis.metrics
-            if isinstance(metric, dict) and isinstance(metric.get("name"), str)
-        }
-        referenced = set(draft.referenced_metrics)
-        self._record_check(
-            "AnswerGroundingCheckpoint",
-            Stage.DRAFT_ANSWER,
-            bool(referenced) and referenced.issubset(metric_names),
-            "Draft answer must reference generated metric names.",
-            {
-                "referenced_metrics": sorted(referenced),
-                "available_metrics": sorted(metric_names),
-            },
+        self._apply_checkpoint(
+            AnswerGroundingCheckpoint().evaluate(draft, analysis),
+            name="AnswerGroundingCheckpoint",
+            stage=Stage.DRAFT_ANSWER,
         )
-        self._record_check(
-            "SuccessCriteriaCheckpoint",
-            Stage.DRAFT_ANSWER,
-            "CPI" in draft.answer and all(criteria for criteria in plan.success_criteria),
-            "Draft answer must satisfy the plan success criteria.",
-            {"success_criteria": plan.success_criteria},
+        self._apply_checkpoint(
+            SuccessCriteriaCheckpoint().evaluate(
+                draft,
+                analysis,
+                plan=plan,
+                question=self.state.question,
+            ),
+            name="SuccessCriteriaCheckpoint",
+            stage=Stage.DRAFT_ANSWER,
         )
+
+    def _apply_checkpoint(
+        self,
+        result: Any,
+        *,
+        name: str,
+        stage: Stage,
+    ) -> None:
+        passed = bool(getattr(result, "passed", False))
+        message = getattr(result, "reason", "") or (
+            result.alarm.message if getattr(result, "alarm", None) is not None else ""
+        )
+        context = {}
+        if getattr(result, "alarm", None) is not None:
+            context = dict(result.alarm.context or {})
+        self._record_check(name, stage, passed, message, context)
 
     def _record_check(
         self,
@@ -468,14 +634,48 @@ class Orchestrator:
     ) -> None:
         self._checks.append(
             {
+                "kind": "checkpoint",
                 "name": name,
                 "stage": stage.value,
                 "passed": bool(passed),
+                "status": "passed" if passed else "failed",
                 "message": message,
                 "context": context or {},
             }
         )
         self._save_json_artifact("checkpoint_results", {"checks": self._checks})
+
+    def _record_guardrail(self, name: str, stage: str, result: Any) -> None:
+        self._guardrails.append(
+            {
+                "kind": "guardrail",
+                "name": name,
+                "stage": stage,
+                "status": "passed" if result.passed else "failed",
+                "message": result.reason,
+            }
+        )
+        self._save_json_artifact("guardrails", self._guardrails)
+
+    def _append_timeline(
+        self,
+        stage_id: str,
+        label: str,
+        status: str,
+        artifact_key: str,
+        summary: str,
+    ) -> None:
+        self._timeline = [item for item in self._timeline if item.get("stage_id") != stage_id]
+        self._timeline.append(
+            {
+                "stage_id": stage_id,
+                "label": label,
+                "status": status,
+                "artifact_key": artifact_key,
+                "summary": summary,
+            }
+        )
+        self._save_json_artifact("timeline", self._timeline)
 
     def _require_stage_checks_passed(self, stage: Stage) -> None:
         failed = [
@@ -484,7 +684,7 @@ class Orchestrator:
             if check["stage"] == stage.value and not check["passed"]
         ]
         if failed:
-            self._raise_with_alarm(
+            self._fail_with_alarm(
                 type="checkpoint_failed",
                 message=f"{stage.value} checkpoint failed.",
                 context={"checks": failed},
@@ -493,6 +693,9 @@ class Orchestrator:
 
     def _set_stage(self, stage: Stage) -> None:
         self.state.current_stage = stage
+        self._checks = [check for check in self._checks if check["stage"] != stage.value]
+        if self._checks:
+            self._save_json_artifact("checkpoint_results", {"checks": self._checks})
         self._persist()
 
     def _save_json_artifact(self, name: str, artifact: Any) -> Path:
@@ -513,29 +716,31 @@ class Orchestrator:
             [alarm.to_dict() for alarm in self.state.alarms],
         )
 
-    def _raise_with_alarm(
-        self,
-        *,
-        type: str,
-        message: str,
-        context: dict[str, Any],
-        retry_from: str,
-    ) -> None:
-        self._escalate_with_alarm(
-            type=type,
-            message=message,
-            context=context,
-            retry_from=retry_from,
-        )
-        raise RuntimeError(message)
+    def _fail_from_result(self, alarm: Alarm | None, *, default_action: str) -> None:
+        if alarm is None:
+            alarm = Alarm(
+                type="guardrail_failed",
+                severity="error",
+                stage=self.state.current_stage.value,
+                message="Guardrail failed.",
+                context={},
+                recommended_action=default_action,
+                retry_from=self._retry_from_current_stage(),
+            )
+        self.route_alarm(alarm)
+        self._persist_alarms()
+        if self.state.current_stage in TERMINAL_STAGES:
+            raise StageControl("halt")
+        raise StageControl("retry")
 
-    def _escalate_with_alarm(
+    def _fail_with_alarm(
         self,
         *,
         type: str,
         message: str,
         context: dict[str, Any],
         retry_from: str,
+        recommended_action: str = "retry",
     ) -> None:
         alarm = Alarm(
             type=type,
@@ -543,11 +748,14 @@ class Orchestrator:
             stage=self.state.current_stage.value,
             message=message,
             context=context,
-            recommended_action="retry",
+            recommended_action=recommended_action,
             retry_from=retry_from,
         )
-        self.escalate(alarm)
+        self.route_alarm(alarm)
         self._persist_alarms()
+        if self.state.current_stage in TERMINAL_STAGES:
+            raise StageControl("halt")
+        raise StageControl("retry")
 
     def _retry_from_current_stage(self) -> str:
         if self.state.current_stage in {
@@ -563,18 +771,11 @@ class Orchestrator:
         return self.runs_dir / self.state.run_id
 
 
-def _five_years_ago() -> date:
+def _five_years_ago():
+    from datetime import date
+
     today = date.today()
     try:
         return today.replace(year=today.year - 5)
     except ValueError:
         return today.replace(month=2, day=28, year=today.year - 5)
-
-
-def _latest_observation_date(rows: list[dict[str, Any]]) -> date | None:
-    if not rows:
-        return None
-    try:
-        return datetime.strptime(str(rows[-1]["date"]), "%Y-%m-%d").date()
-    except (KeyError, TypeError, ValueError):
-        return None

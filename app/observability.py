@@ -47,33 +47,96 @@ def list_run_ids(runs_dir: str | Path = DEFAULT_RUNS_DIR) -> list[str]:
     )
 
 
+CORE_ARTIFACTS = [
+    "input.json",
+    "guardrails.json",
+    "plan.json",
+    "fred_search.json",
+    "selected_data.json",
+    "data.json",
+    "generated_code.py",
+    "analysis.json",
+    "checkpoint_results.json",
+    "draft.json",
+    "checker.json",
+    "final_answer.json",
+    "alarms.json",
+    "timeline.json",
+    "state.json",
+]
+
+
 def main() -> None:
     st.set_page_config(page_title="EconCheck Observability", layout="wide")
     st.title("Observability")
+    st.caption("Read-only reconstruction of harness runs from persisted artifacts.")
 
     run_ids = list_run_ids()
     if not run_ids:
-        st.info("No runs found.")
+        st.info("No runs found yet. Submit a question from the Chat page first.")
         return
 
-    run_id = st.selectbox("Run", run_ids, index=len(run_ids) - 1)
+    default_index = len(run_ids) - 1
+    current_run_id = st.session_state.get("current_run_id")
+    if current_run_id in run_ids:
+        default_index = run_ids.index(current_run_id)
+
+    run_id = st.selectbox("Run", run_ids, index=default_index)
     view = load_run_view(run_id)
+    artifacts = view.get("artifacts", {})
     state = view.get("state") or {}
+
+    st.subheader("Run Summary")
     st.write(
         {
             "run_id": run_id,
+            "question": state.get("question"),
             "current_stage": state.get("current_stage"),
             "retry_count": state.get("retry_count"),
+            "max_turns": state.get("max_turns"),
         }
     )
 
-    final_answer = view["artifacts"].get("final_answer.json")
+    timeline = artifacts.get("timeline.json")
+    if isinstance(timeline, list) and timeline:
+        st.subheader("Timeline")
+        st.table(
+            [
+                {
+                    "stage": item.get("label") or item.get("stage_id"),
+                    "status": item.get("status"),
+                    "summary": item.get("summary"),
+                }
+                for item in timeline
+                if isinstance(item, dict)
+            ]
+        )
+
+    final_answer = artifacts.get("final_answer.json")
     if isinstance(final_answer, dict) and final_answer.get("answer"):
         st.subheader("Released Answer")
         st.write(final_answer["answer"])
 
-    for name, artifact in view["artifacts"].items():
+    alarms = artifacts.get("alarms.json") or []
+    if alarms:
+        st.subheader("Alarms")
+        st.json(alarms)
+
+    st.subheader("Artifacts")
+    for name in CORE_ARTIFACTS:
+        if name not in artifacts:
+            continue
+        with st.expander(name, expanded=name in {"checkpoint_results.json", "guardrails.json"}):
+            artifact = artifacts[name]
+            if isinstance(artifact, str):
+                st.code(artifact, language="python" if name.endswith(".py") else None)
+            else:
+                st.json(artifact)
+
+    extra = sorted(set(artifacts) - set(CORE_ARTIFACTS))
+    for name in extra:
         with st.expander(name):
+            artifact = artifacts[name]
             if isinstance(artifact, str):
                 st.code(artifact)
             else:

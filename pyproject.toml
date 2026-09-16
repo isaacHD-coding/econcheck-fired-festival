@@ -9,6 +9,7 @@ description = "A governed economic-analysis harness for querying FRED data."
 requires-python = ">=3.11"
 dependencies = [
     "openai",
+    "python-dotenv",
     "streamlit",
 ]
 
