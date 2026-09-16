@@ -103,7 +103,7 @@ Live tests **skip** when the matching API key is unset. They do not fail the sui
 - Planning guardrails: planner schema and approved tools
 - Data, code, and answer checkpoints, including provenance (no invented series)
 - Alarm routing with retry from `planning`, `data_discovery`, `code_generation`, or `draft_answer`, then escalation after `max_turns`
-- OpenAI worker calls use a 45s timeout and **no SDK retries** (the harness owns retries). A whole run also has a 4-minute wall-clock deadline and a stage-loop cap so the UI cannot spin forever.
+- OpenAI worker calls use a **30s hard timeout on a daemon thread** and **no SDK retries**. A whole run also has a 3-minute wall-clock deadline and a stage-loop cap so the UI cannot spin forever. Ctrl+C should stop promptly instead of sitting on Streamlit “Stopping…” while HTTP finishes.
 - Subprocess-backed analysis sandbox
 - Streamlit chat + observability for real runs under `runs/`
 - Mock worker for a reproducible CPI demo, unemployment-style single-series questions, and inflation-vs-real-GDP correlation when FRED search returns both `CPIAUCSL` and `GDPC1`
@@ -113,7 +113,7 @@ Live tests **skip** when the matching API key is unset. They do not fail the sui
 
 - The mock worker is a small deterministic specialist, not a general economist. It plans the canonical CPI demo onto `CPIAUCSL`, inflation-vs-real-GDP questions onto `CPIAUCSL`+`GDPC1` when those IDs appear in search results, and otherwise uses live search hits. It never invents series IDs.
 - OpenAI mode keeps a canonical CPI analysis/draft fallback only for the exact demo CPI question when the fetched data is CPI-only. Questions about correlation, GDP, or multiple series do not get that canned CPI paragraph.
-- OpenAI calls are capped at 45 seconds each (SDK retries disabled). A live OpenAI run should finish or escalate within about four minutes; if the model is slow you may see a `run_deadline_exceeded` or OpenAI timeout alarm instead of a hang. Planning progress is written to the run timeline as `in_progress` so Observability can show the current stage.
+- OpenAI calls are capped at 30 seconds each (SDK retries disabled, wait happens off the Streamlit script thread). A live OpenAI run should finish or escalate within about three minutes; if the model is slow you may see a `run_deadline_exceeded` or OpenAI timeout alarm instead of a hang. Ctrl+C persists a `run_interrupted` alarm and re-raises so “Stopping…” does not wait on a blocking HTTP call.
 - Mixed-frequency relationship analysis aligns series by carrying higher-frequency values forward onto lower-frequency dates and reports contemporaneous growth-rate correlation, not a causal or full lead-lag model.
 - Data is FRED-only. Forecasting, policy advice, and non-economic questions are rejected.
 - Replay/resume from an arbitrary checkpoint, MCP, and extra data providers are out of scope.

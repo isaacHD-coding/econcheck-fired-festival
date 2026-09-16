@@ -54,8 +54,8 @@ RETRY_STAGES = {
     "draft_answer": Stage.DRAFT_ANSWER,
 }
 
-# Whole-run wall clock. OpenAI calls are separately capped at 45s with no SDK retries.
-DEFAULT_RUN_DEADLINE_SECONDS = 240.0
+# Whole-run wall clock. Each OpenAI call has a 30s hard timeout on a daemon thread.
+DEFAULT_RUN_DEADLINE_SECONDS = 180.0
 
 
 class StageControl(Exception):
@@ -98,12 +98,16 @@ class Orchestrator:
         self._notify(state.current_stage.value, "Run started.")
 
     def run(self) -> RunState:
-        if self.worker is not None:
-            return self._run_integrated()
+        try:
+            if self.worker is not None:
+                return self._run_integrated()
 
-        while self.state.current_stage not in TERMINAL_STAGES:
-            self.advance_stage()
-        return self.state
+            while self.state.current_stage not in TERMINAL_STAGES:
+                self.advance_stage()
+            return self.state
+        except KeyboardInterrupt:
+            self._mark_interrupted()
+            raise
 
     def advance_stage(self) -> RunState:
         if self.state.current_stage in TERMINAL_STAGES:
@@ -752,6 +756,25 @@ class Orchestrator:
             self.progress_callback(stage, message)
         except Exception:
             return
+
+    def _mark_interrupted(self) -> None:
+        if self.state.current_stage in TERMINAL_STAGES:
+            return
+        self.escalate(
+            Alarm(
+                type="run_interrupted",
+                severity="error",
+                stage=self.state.current_stage.value,
+                message=(
+                    "Run was interrupted (Ctrl+C). Persisted the current stage "
+                    "instead of waiting on a blocking OpenAI call."
+                ),
+                context={"retry_count": self.state.retry_count},
+                recommended_action="escalate",
+                retry_from=self._retry_from_current_stage(),
+            )
+        )
+        self._persist_alarms()
 
     def _raise_if_over_budget(self) -> None:
         if self._loop_iterations > self._max_loop_iterations:

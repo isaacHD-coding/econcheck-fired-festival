@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
 import json
-from typing import Any
+import threading
+from typing import Any, Callable, TypeVar
 
 from harness.config import resolve_openai_api_key as _resolve_openai_api_key
 
 
 DEFAULT_OPENAI_MODEL = "gpt-5.5"
-# Harness owns retries. The SDK default (2 retries × 10-minute timeout) can
-# look like a hang in planning.
-DEFAULT_OPENAI_TIMEOUT_SECONDS = 45.0
+# Harness owns retries. The SDK default (2 retries × 10-minute timeout) made
+# Ctrl+C sit on Streamlit "Stopping…" while a blocking HTTP call finished.
+DEFAULT_OPENAI_TIMEOUT_SECONDS = 30.0
+DEFAULT_OPENAI_CONNECT_TIMEOUT_SECONDS = 5.0
 DEFAULT_OPENAI_MAX_RETRIES = 0
+
+T = TypeVar("T")
 
 
 class OpenAIClientError(RuntimeError):
@@ -54,46 +59,55 @@ def call_openai_json(
 
     client = OpenAI(
         api_key=resolved_api_key,
-        timeout=timeout_seconds,
+        timeout=_sdk_timeout(timeout_seconds),
         max_retries=max_retries,
     )
-    try:
-        response = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": instructions},
-                {
-                    "role": "user",
-                    "content": json.dumps(input_payload, sort_keys=True),
+
+    def invoke() -> dict[str, Any]:
+        try:
+            response = client.responses.create(
+                model=model,
+                input=[
+                    {"role": "system", "content": instructions},
+                    {
+                        "role": "user",
+                        "content": json.dumps(input_payload, sort_keys=True),
+                    },
+                ],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema,
+                    }
                 },
-            ],
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": schema_name,
-                    "strict": True,
-                    "schema": schema,
-                }
-            },
-        )
-    except Exception as exc:
-        raise OpenAIClientError(
-            f"OpenAI Responses API call failed for {schema_name}: {exc.__class__.__name__}"
-        ) from exc
+            )
+        except Exception as exc:
+            raise OpenAIClientError(
+                f"OpenAI Responses API call failed for {schema_name}: {exc.__class__.__name__}"
+            ) from exc
 
-    output_text = _response_output_text(response)
+        output_text = _response_output_text(response)
+        try:
+            parsed = json.loads(output_text)
+        except json.JSONDecodeError as exc:
+            raise OpenAIClientError(
+                f"OpenAI response for {schema_name} was not valid JSON."
+            ) from exc
+
+        if not isinstance(parsed, dict):
+            raise OpenAIClientError(
+                f"OpenAI response for {schema_name} must be a JSON object."
+            )
+        return parsed
+
     try:
-        parsed = json.loads(output_text)
-    except json.JSONDecodeError as exc:
+        return _run_with_hard_timeout(invoke, timeout_seconds)
+    except FuturesTimeoutError as exc:
         raise OpenAIClientError(
-            f"OpenAI response for {schema_name} was not valid JSON."
+            f"OpenAI {schema_name} call timed out after {timeout_seconds:.0f}s."
         ) from exc
-
-    if not isinstance(parsed, dict):
-        raise OpenAIClientError(
-            f"OpenAI response for {schema_name} must be a JSON object."
-        )
-    return parsed
 
 
 def _response_output_text(response: Any) -> str:
@@ -117,3 +131,38 @@ def _response_output_text(response: Any) -> str:
             return "".join(parts)
 
     raise OpenAIClientError("OpenAI response did not include output_text.")
+
+
+def _sdk_timeout(timeout_seconds: float) -> Any:
+    try:
+        from httpx import Timeout
+    except Exception:
+        return timeout_seconds
+    return Timeout(
+        timeout_seconds,
+        connect=min(DEFAULT_OPENAI_CONNECT_TIMEOUT_SECONDS, timeout_seconds),
+        read=timeout_seconds,
+        write=min(10.0, timeout_seconds),
+        pool=timeout_seconds,
+    )
+
+
+def _run_with_hard_timeout(fn: Callable[[], T], timeout_seconds: float) -> T:
+    """Wait on a daemon thread so a stuck HTTP call cannot pin the main thread.
+
+    Streamlit Ctrl+C shows "Stopping…" until the script thread returns. Waiting
+    here is interruptible; the SDK socket call is not.
+    """
+
+    future: Future[T] = Future()
+
+    def worker() -> None:
+        try:
+            future.set_result(fn())
+        except BaseException as exc:  # noqa: BLE001 — propagate into Future
+            if not future.done():
+                future.set_exception(exc)
+
+    thread = threading.Thread(target=worker, name="econcheck-openai-call", daemon=True)
+    thread.start()
+    return future.result(timeout=timeout_seconds)

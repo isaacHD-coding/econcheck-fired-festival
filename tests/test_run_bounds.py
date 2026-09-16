@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from types import SimpleNamespace
 
+import pytest
+
 import harness.orchestrator as orchestrator_module
 from harness.checkpoints.base import CheckpointResult
 from harness.orchestrator import Orchestrator
@@ -14,6 +16,7 @@ from workers.mock_worker import MockWorker
 from workers.openai_client import (
     DEFAULT_OPENAI_MAX_RETRIES,
     DEFAULT_OPENAI_TIMEOUT_SECONDS,
+    OpenAIClientError,
     call_openai_json,
 )
 
@@ -203,8 +206,66 @@ def test_call_openai_json_disables_sdk_retries_and_sets_timeout(monkeypatch) -> 
     )
 
     assert parsed == {"ok": True}
-    assert captured["timeout"] == DEFAULT_OPENAI_TIMEOUT_SECONDS
+    timeout = captured["timeout"]
+    read_timeout = getattr(timeout, "read", timeout)
+    assert float(read_timeout) == DEFAULT_OPENAI_TIMEOUT_SECONDS
     assert captured["max_retries"] == DEFAULT_OPENAI_MAX_RETRIES
+
+
+def test_call_openai_json_hard_timeout_returns_before_blocking_create_finishes(
+    monkeypatch,
+) -> None:
+    started = time.monotonic()
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            time.sleep(5)
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs) -> None:
+            self.responses = FakeResponses()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+
+    with pytest.raises(OpenAIClientError, match="timed out"):
+        call_openai_json(
+            schema_name="probe",
+            schema={"type": "object"},
+            instructions="return json",
+            input_payload={"q": "hi"},
+            api_key="test-key",
+            timeout_seconds=0.3,
+        )
+
+    assert time.monotonic() - started < 1.5
+
+
+def test_ctrl_c_persists_escalation_instead_of_swallowing_interrupt(tmp_path) -> None:
+    class BlockingWorker(MockWorker):
+        def plan(self, question, state):
+            raise KeyboardInterrupt()
+
+    state = RunState(
+        run_id="interrupt",
+        question=ISAAC_QUESTION,
+        current_stage=Stage.INPUT,
+        retry_count=0,
+    )
+    orchestrator = Orchestrator(
+        state,
+        runs_dir=tmp_path,
+        worker=BlockingWorker(),
+        checker=MockChecker(),
+        fred_api_key="judge-key",
+        deadline_seconds=None,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.run()
+
+    assert orchestrator.state.current_stage is Stage.ESCALATED
+    assert any(alarm.type == "run_interrupted" for alarm in orchestrator.state.alarms)
 
 
 def _cpi_search_result() -> SeriesSearchResult:
